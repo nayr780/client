@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+redis
+arq
+requests
+websockets
+openpyxl
+python-multipart
