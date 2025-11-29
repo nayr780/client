@@ -2,10 +2,10 @@
 # queue_client_front.py — Versão cliente do painel ISS
 #
 # Agora:
-# - Front continua falando com Redis via WebSocket (AsyncRedisWS) para sessões, runs, logs etc.
-# - Jobs são enfileirados DIRETO no ARQ usando arq.enqueue_job (via Redis TCP, mesmo Redis do worker).
-# - NÃO existe mais scheduler_y_to_arq.
-# - (Opcional) pré-fila Y pode ser mantida só como metadado para status/logs, se você quiser.
+# - Front fala com Redis via WebSocket (AsyncRedisWS) para sessões, runs, logs etc.
+# - Jobs SÓ são colocados na PRÉ-FILA Y (listas Redis) via WS.
+# - O worker externo (que você controla) é quem lê a PRÉ-FILA Y e executa/enfileira no que quiser.
+# - NÃO existe conexão TCP direta com Redis aqui, nem porta 6380, nem proxy.
 
 import os
 import time
@@ -13,7 +13,6 @@ import uuid
 import json
 import asyncio
 from typing import Dict, Any, List, Optional
-from types import SimpleNamespace
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Form  # type: ignore
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -23,10 +22,6 @@ import requests
 
 # === WS client simples (mesmo que você já tinha) ===
 from redis_ws_client import AsyncRedisWS
-
-# === ARQ (conexão TCP para enqueue_job real) ===
-from arq import create_pool
-from arq.connections import RedisSettings
 
 # ===================== CONFIG =====================
 
@@ -40,20 +35,8 @@ PREQUEUE_COLABS_SET = f"{PREQUEUE_NS}:colabs"
 
 FRONT_LAST_RUN_KEY = f"{REDIS_LOG_NS}:front:last_run_ts"
 
-# Conexão ARQ (via proxy TCP local) — MESMO Redis que o worker usa
-ARQ_REDIS_HOST = os.getenv("ARQ_REDIS_HOST", "127.0.0.1")
-ARQ_REDIS_PORT = int(os.getenv("ARQ_REDIS_PORT", "6380"))
-ARQ_REDIS_DB = int(os.getenv("ARQ_REDIS_DB", "0"))
-
-ARQ_REDIS_SETTINGS = RedisSettings(
-    host=ARQ_REDIS_HOST,
-    port=ARQ_REDIS_PORT,
-    database=ARQ_REDIS_DB,
-    ssl=False,
-)
-
-# Flag informativa para o front
-ARQ_ENABLED = True
+# Flag informativa para o front: aqui NÃO usamos ARQ diretamente.
+ARQ_ENABLED = False
 
 # ===================== SESSÕES =====================
 
@@ -174,7 +157,7 @@ def merge_status(current: str, new: str) -> str:
 
 # ===================== APP =====================
 
-app = FastAPI(title="ISS Queue Front (Cliente) — WS + ARQ direto")
+app = FastAPI(title="ISS Queue Front (Cliente) — WS + Pré-fila Y")
 
 app.add_middleware(
     CORSMiddleware,
@@ -202,6 +185,9 @@ async def get_session_from_request(request: Request) -> Optional[Dict[str, Any]]
         return json.loads(raw)
     except Exception:
         return None
+
+
+# ===================== HTML SIMPLES =====================
 
 
 # ===================== HTML LOGIN =====================
@@ -1681,6 +1667,8 @@ PAGE_CLIENT = """<!doctype html>
 </html>
 """
 
+
+
 # ===================== AUTH MIDDLEWARE =====================
 
 
@@ -1712,7 +1700,7 @@ async def auth_middleware(request: Request, call_next):
 
 @app.on_event("startup")
 async def startup():
-    # WS (metadados)
+    # WS (metadados / sessões / pré-fila / logs)
     app.state.redis = AsyncRedisWS(REDIS_WS_URL, token=REDIS_TOKEN)
     try:
         await app.state.redis.connect()
@@ -1724,14 +1712,6 @@ async def startup():
     except Exception as e:
         print(f"[startup] ERRO WS {REDIS_WS_URL}: {e!r}")
 
-    # ARQ (TCP) – mesmo Redis do worker (proxy local)
-    try:
-        app.state.arq_redis = await create_pool(ARQ_REDIS_SETTINGS)
-        print(f"[startup] Conectado ao Redis ARQ em {ARQ_REDIS_HOST}:{ARQ_REDIS_PORT}")
-    except Exception as e:
-        app.state.arq_redis = None
-        print(f"[startup] ERRO ao conectar ARQ Redis: {e!r}")
-
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -1740,14 +1720,7 @@ async def shutdown():
     except Exception:
         pass
 
-    try:
-        arq_rd = getattr(app.state, "arq_redis", None)
-        if arq_rd is not None:
-            await arq_rd.aclose()
-    except Exception:
-        pass
-
-    print("Shutdown concluído (WS + ARQ fechados).")
+    print("Shutdown concluído (WS fechado).")
 
 
 # ===================== RUNS PERSISTÊNCIA =====================
@@ -1761,14 +1734,12 @@ async def load_runs(rd: AsyncRedisWS, tenant: str) -> Dict[str, Dict[str, Any]]:
         return {}
     # raw pode ser None, bytes, str, ou até uma string JSON duplamente-serializada.
     try:
-        # se for bytes, garantir str
         if isinstance(raw, (bytes, bytearray)):
             raw = raw.decode(errors="ignore")
         if isinstance(raw, str):
             data = json.loads(raw)
             if isinstance(data, dict):
                 return data
-            # caso esteja double-encoded (string dentro de string)
             if isinstance(data, str):
                 try:
                     data2 = json.loads(data)
@@ -1778,44 +1749,14 @@ async def load_runs(rd: AsyncRedisWS, tenant: str) -> Dict[str, Dict[str, Any]]:
                     pass
     except Exception:
         pass
-    # se falhar, log para diagnóstico e retornar vazio (não quebrar)
     print("[load_runs] dado corrompido para runs:", repr(str(raw)[:500]))
     return {}
-
 
 
 async def save_runs(rd: AsyncRedisWS, tenant: str, data: Dict[str, Dict[str, Any]]):
     if not tenant:
         return
     await rd.set(runs_key_for(tenant), json.dumps(data))
-
-
-# ===================== ENQUEUE DIRETO NO ARQ =====================
-
-async def enqueue_direct_to_arq(func: str, args_list: List[Any], job_id: str):
-    """
-    Usa ARQ para enfileirar. Se ARQ não estiver disponível (ex: no Render),
-    faz fallback: registra e retorna um objeto fake com job_id para não explodir.
-    """
-    arq_rd = getattr(app.state, "arq_redis", None)
-    if arq_rd is None:
-        # Fallback rápido: já colocamos espelho na pré-fila (rpush acima),
-        # aqui apenas retornamos um "job" fake para que o front continue.
-        print(f"[enqueue_direct_to_arq] ARQ não inicializado — fallback. job {job_id}")
-        return SimpleNamespace(job_id=job_id)
-
-    # se arq_rd existe, enfileira normalmente
-    job = await arq_rd.enqueue_job(
-        func,
-        *args_list,
-        _job_id=job_id,
-    )
-    if job is None:
-        print(f"[enqueue_direct_to_arq] Job {job_id} já existia, não reenfileirado.")
-    else:
-        print(f"[enqueue_direct_to_arq] Job {job.job_id} → {func}{tuple(args_list)}")
-    return job
-
 
 
 # ===================== ROTAS =====================
@@ -1904,8 +1845,8 @@ async def api_enqueue(request: Request, payload: Dict[str, Any]):
     """
     Enfileira jobs:
       1) Cria execuções (runs) por CNPJ.
-      2) Opcional: guarda um "espelho" na pré-fila Y (para status simples).
-      3) Enfileira DIRETO no ARQ usando enqueue_job (sem scheduler).
+      2) Guarda um "espelho" na pré-fila Y (para status/logs).
+      3) NÃO fala com Redis TCP nem ARQ aqui; o worker lê a pré-fila Y.
     """
     rd = rds()
 
@@ -2008,7 +1949,7 @@ async def api_enqueue(request: Request, payload: Dict[str, Any]):
 
             job_id = uuid.uuid4().hex
 
-            # Espelho na pré-fila (opcional, ajuda nas telas de status/logs)
+            # Espelho na pré-fila (worker vai ler isso)
             env = {
                 "func": func,
                 "args": args,
@@ -2018,9 +1959,6 @@ async def api_enqueue(request: Request, payload: Dict[str, Any]):
             y_key = f"{PREQUEUE_NS}:colab:{colaborador_norm}"
             await rd.sadd(PREQUEUE_COLABS_SET, colaborador_norm)
             await rd.rpush(y_key, json.dumps(env))
-
-            # Enfileira de verdade no ARQ
-            await enqueue_direct_to_arq(func, args, job_id)
 
             total_jobs += 1
             run_job_ids.append(job_id)
@@ -2104,7 +2042,6 @@ async def build_status_index(
 ) -> Dict[str, Any]:
     """
     Monta índice de status por CNPJ/mes baseado na PRÉ-FILA Y.
-    (Você pode evoluir depois para ler status do ARQ/Job.result, se quiser.)
     """
     rd: AsyncRedisWS = rds()
     job_events: Dict[str, Dict[str, Any]] = {}
@@ -2122,7 +2059,7 @@ async def build_status_index(
         k: {e: [] for e in etapas} for k in keys
     }
 
-    running_count = 0  # se quiser, depois dá pra usar ARQ pra saber quem tá rodando
+    running_count = 0
     queue_count = 0
 
     def add_job_event(job_id: Optional[str], cd: str, mes: str, etapa: str, status: str):
@@ -2583,7 +2520,7 @@ async def api_stop_all(request: Request):
     """
     Stop All:
       - limpa PRÉ-FILA Y do tenant (jobs ainda não pegos pelo worker)
-      - não aborta jobs já enfileirados/rodando no ARQ (isso dá pra fazer depois via Job.abort se você quiser)
+      - NÃO aborta jobs já enfileirados/rodando em qualquer outro sistema.
     """
     rd = rds()
 
@@ -2629,7 +2566,7 @@ async def api_stop_all(request: Request):
 
     return {
         "status": "ok",
-        "stopped_jobs": 0,  # se quiser, depois pode integrar com Job.abort
+        "stopped_jobs": 0,
         "prequeue_removed": prequeue_removed,
         "ids": [],
         "arq_enabled": ARQ_ENABLED,
