@@ -13,6 +13,7 @@ import uuid
 import json
 import asyncio
 from typing import Dict, Any, List, Optional
+from types import SimpleNamespace
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Form  # type: ignore
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -1758,10 +1759,29 @@ async def load_runs(rd: AsyncRedisWS, tenant: str) -> Dict[str, Dict[str, Any]]:
     raw = await rd.get(runs_key_for(tenant))
     if not raw:
         return {}
+    # raw pode ser None, bytes, str, ou até uma string JSON duplamente-serializada.
     try:
-        return json.loads(raw)
+        # se for bytes, garantir str
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode(errors="ignore")
+        if isinstance(raw, str):
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return data
+            # caso esteja double-encoded (string dentro de string)
+            if isinstance(data, str):
+                try:
+                    data2 = json.loads(data)
+                    if isinstance(data2, dict):
+                        return data2
+                except Exception:
+                    pass
     except Exception:
-        return {}
+        pass
+    # se falhar, log para diagnóstico e retornar vazio (não quebrar)
+    print("[load_runs] dado corrompido para runs:", repr(str(raw)[:500]))
+    return {}
+
 
 
 async def save_runs(rd: AsyncRedisWS, tenant: str, data: Dict[str, Dict[str, Any]]):
@@ -1774,27 +1794,28 @@ async def save_runs(rd: AsyncRedisWS, tenant: str, data: Dict[str, Dict[str, Any
 
 async def enqueue_direct_to_arq(func: str, args_list: List[Any], job_id: str):
     """
-    Usa o próprio ARQ para enfileirar (NADA de inventar formato de pickle).
-    Conecta no Redis TCP via ARQ_REDIS_SETTINGS (mesmo Redis do worker).
+    Usa ARQ para enfileirar. Se ARQ não estiver disponível (ex: no Render),
+    faz fallback: registra e retorna um objeto fake com job_id para não explodir.
     """
     arq_rd = getattr(app.state, "arq_redis", None)
     if arq_rd is None:
-        raise RuntimeError("ARQ Redis não inicializado (ver startup).")
+        # Fallback rápido: já colocamos espelho na pré-fila (rpush acima),
+        # aqui apenas retornamos um "job" fake para que o front continue.
+        print(f"[enqueue_direct_to_arq] ARQ não inicializado — fallback. job {job_id}")
+        return SimpleNamespace(job_id=job_id)
 
-    # args_list vira *args normal
+    # se arq_rd existe, enfileira normalmente
     job = await arq_rd.enqueue_job(
         func,
         *args_list,
         _job_id=job_id,
-        # se no futuro quiser separar filas, pode usar _queue_name aqui
     )
     if job is None:
-        # _job_id duplicado -> ARQ não enfileira de novo
         print(f"[enqueue_direct_to_arq] Job {job_id} já existia, não reenfileirado.")
     else:
         print(f"[enqueue_direct_to_arq] Job {job.job_id} → {func}{tuple(args_list)}")
-
     return job
+
 
 
 # ===================== ROTAS =====================
