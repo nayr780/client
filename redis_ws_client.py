@@ -9,6 +9,7 @@ import websockets
 class RedisRESPError(Exception):
     pass
 
+
 class AsyncRedisWS:
     def __init__(self, url: str, token: str = "", connect_timeout: float = 10.0):
         # url = "wss://redisrender.onrender.com"
@@ -112,7 +113,6 @@ class AsyncRedisWS:
         return parse_at()
 
     # executor genérico
-    # executor genérico
     async def execute(self, *parts: Union[str, int, bytes]) -> Any:
         async with self._lock:
             payload = self._encode_cmd(*parts)
@@ -153,7 +153,6 @@ class AsyncRedisWS:
                 print("[redis_ws_client] parse error:", e, "raw_snippet:", snippet)
                 await self.aclose()
                 return None
-
 
     # -------------------------------------------------------
     # COMANDOS BÁSICOS
@@ -215,8 +214,10 @@ class AsyncRedisWS:
 
     async def ttl(self, key: str) -> Optional[int]:
         r = await self.execute("TTL", key)
-        try: return int(r)
-        except: return None
+        try:
+            return int(r)
+        except Exception:
+            return None
 
     # -------------------------------------------------------
     # HASHES (necessário pro ARQ + scheduler)
