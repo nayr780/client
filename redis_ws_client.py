@@ -112,12 +112,48 @@ class AsyncRedisWS:
         return parse_at()
 
     # executor genérico
+    # executor genérico
     async def execute(self, *parts: Union[str, int, bytes]) -> Any:
         async with self._lock:
             payload = self._encode_cmd(*parts)
-            await self._send_raw(payload)
-            data = await self._recv_raw()
-            return self._parse_resp(data)
+            try:
+                await self._send_raw(payload)
+            except Exception as e:
+                # falha ao enviar -> force close para reconectar próxima vez
+                print("[redis_ws_client] send error, closing ws:", repr(e))
+                await self.aclose()
+                raise
+
+            try:
+                data = await self._recv_raw()
+            except Exception as e:
+                print("[redis_ws_client] recv error, closing ws:", repr(e))
+                await self.aclose()
+                raise
+
+            # Se vier algo que NÃO parece RESP, não explodir — fechar conexão e retornar None.
+            if not data or data[:1] not in b"+-:$*":
+                try:
+                    txt = data.decode(errors="replace")
+                except Exception:
+                    txt = repr(data[:200])
+                print("[redis_ws_client] recv non-RESP payload, closing ws. raw:", txt[:1000])
+                # força reconectar na próxima chamada
+                await self.aclose()
+                return None
+
+            try:
+                return self._parse_resp(data)
+            except RedisRESPError as e:
+                # log e reconectar — não propagar exceção que quebre o ASGI handler
+                try:
+                    snippet = data.decode(errors="replace")[:1000]
+                except Exception:
+                    snippet = repr(data[:200])
+                print("[redis_ws_client] parse error:", e, "raw_snippet:", snippet)
+                await self.aclose()
+                return None
+
 
     # -------------------------------------------------------
     # COMANDOS BÁSICOS
