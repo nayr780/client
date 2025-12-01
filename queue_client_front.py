@@ -1,170 +1,463 @@
 #!/usr/bin/env python3
-# queue_client_front.py — Versão cliente do painel ISS (WS-only, sem ARQ)
-#
-# Este front se conecta DIRETO ao Redis via WebSocket (sem proxy TCP local).
-# - Enfileira jobs por CNPJ/etapa na pré-fila Y.
-# - Mostra status por EXECUÇÃO (cada clique em "Lançar Execução" por CNPJ).
-# - Exibe logs por EXECUÇÃO / por JOB.
-# - Stop All (limpa a pré-fila Y do tenant).
-#
-# IMPORTANTE:
-#   - Para WS configure:
-#       REDIS_WS_URL  (ex: wss://redisrender.onrender.com)
-#       REDIS_TOKEN   (opcional)
-#
-#   - NÃO há mais ARQ aqui. O consumo da fila (worker) deve ser feito
-#     lendo os envs da pré-fila Y (por ex.: BLPOP/BRPOP nas listas
-#     iss:y:colab:<colab_norm>).
+# queue_client_front.py — Backend WS bridge + REST, com status e logs em tempo real
 
 import os
 import time
 import uuid
 import json
+import pickle
 import asyncio
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union, Tuple, Set
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Form  # type: ignore
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+import requests
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    UploadFile,
+    File,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+    Form,
+)
+from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# === WS client simples ===
-from redis_ws_client import AsyncRedisWS
+# ===================== DEBUG HELPERS =====================
+
+DEBUG = os.getenv("DEBUG_QUEUE_FRONT", "1").lower() in ("1", "true", "yes")
+
+def dbg(*args):
+    if DEBUG:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        print(f"[dbg {ts}]", *args)
+
+# ===================== CLIENTE WS RESP (inline) =====================
+
+import websockets
+
+class RedisRESPError(Exception):
+    pass
+
+class AsyncRedisWS:
+    """
+    Cliente mínimo RESP sobre WebSocket.
+    Suporta: + - : $ * (simple string, error, integer, bulk, array)
+    """
+    def __init__(self, url: str, token: str = "", connect_timeout: float = 10.0, name: str = "cmd"):
+        self.url = f"{url}?token={token}" if token else url
+        self._ws: Optional[websockets.WebSocketClientProtocol] = None
+        self._lock = asyncio.Lock()
+        self._connect_timeout = connect_timeout
+        self._name = name
+
+    async def connect(self):
+        if self._ws is not None and not getattr(self._ws, "closed", False):
+            return
+        dbg(f"[redis-{self._name}] connecting -> {self.url}")
+        self._ws = await websockets.connect(self.url, max_size=None)
+        dbg(f"[redis-{self._name}] connected")
+
+    async def aclose(self):
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+                dbg(f"[redis-{self._name}] closed")
+            except Exception as e:
+                dbg(f"[redis-{self._name}] close error:", repr(e))
+            self._ws = None
+
+    def _encode_cmd(self, *parts: Union[str, bytes, int, float]) -> bytes:
+        out = bytearray()
+        out.extend(f"*{len(parts)}\r\n".encode())
+        for p in parts:
+            if isinstance(p, (bytes, bytearray)):
+                s = bytes(p)
+            else:
+                s = str(p).encode()
+            out.extend(f"${len(s)}\r\n".encode())
+            out.extend(s)
+            out.extend(b"\r\n")
+        return bytes(out)
+
+    def _read_line(self, buf: bytearray, start: int = 0) -> Tuple[bytes, int]:
+        i = buf.find(b"\r\n", start)
+        if i == -1:
+            raise RedisRESPError("incomplete")
+        return bytes(buf[start:i]), i + 2
+
+    def _parse_resp(self, data: bytes) -> Any:
+        buf = bytearray(data)
+        pos = 0
+
+        def parse_at():
+            nonlocal pos
+            if pos >= len(buf):
+                raise RedisRESPError("empty")
+            prefix = chr(buf[pos]); pos += 1
+
+            if prefix == "+":
+                line, pos2 = self._read_line(buf, pos); pos = pos2
+                return line.decode()
+
+            if prefix == "-":
+                line, pos2 = self._read_line(buf, pos); pos = pos2
+                raise RedisRESPError(line.decode())
+
+            if prefix == ":":
+                line, pos2 = self._read_line(buf, pos); pos = pos2
+                return int(line.decode())
+
+            if prefix == "$":
+                line, pos2 = self._read_line(buf, pos); pos = pos2
+                n = int(line.decode())
+                if n == -1:
+                    return None
+                res = bytes(buf[pos : pos + n])
+                pos += n + 2
+                return res.decode(errors="replace")
+
+            if prefix == "*":
+                line, pos2 = self._read_line(buf, pos); pos = pos2
+                n = int(line.decode())
+                if n == -1:
+                    return None
+                arr = []
+                for _ in range(n):
+                    arr.append(parse_at())
+                return arr
+
+            raise RedisRESPError("unknown prefix")
+        return parse_at()
+
+    async def _send_raw(self, data: bytes):
+        if self._ws is None or getattr(self._ws, "closed", False):
+            await self.connect()
+        await self._ws.send(data)
+
+    async def _recv_raw(self) -> bytes:
+        if self._ws is None or getattr(self._ws, "closed", False):
+            await self.connect()
+        msg = await self._ws.recv()
+        return msg if isinstance(msg, (bytes, bytearray)) else msg.encode()
+
+    async def execute(self, *parts: Union[str, int, float, bytes]) -> Any:
+        async with self._lock:
+            payload = self._encode_cmd(*parts)
+            try:
+                await self._send_raw(payload)
+                data = await self._recv_raw()
+            except Exception:
+                await self.aclose()
+                raise
+
+            if not data or data[:1] not in b"+-:$*":
+                await self.aclose()
+                return None
+
+            try:
+                return self._parse_resp(data)
+            except RedisRESPError:
+                await self.aclose()
+                return None
+
+    # ===== Comandos =====
+    async def ping(self) -> bool:
+        r = await self.execute("PING")
+        return (r == "PONG") or (r is not None)
+
+    async def get(self, key: str) -> Optional[str]:
+        return await self.execute("GET", key)
+
+    async def set(self, key: str, value: Union[str, bytes], ex: Optional[int] = None):
+        if ex is None:
+            return await self.execute("SET", key, value)
+        return await self.execute("SET", key, value, "EX", int(ex))
+
+    async def delete(self, *keys: str):
+        return await self.execute("DEL", *keys)
+
+    async def sadd(self, key: str, *members: str):
+        return await self.execute("SADD", key, *members)
+
+    async def srem(self, key: str, *members: str):
+        return await self.execute("SREM", key, *members)
+
+    async def smembers(self, key: str) -> List[str]:
+        r = await self.execute("SMEMBERS", key)
+        return [] if not r else [str(x) for x in r]
+
+    async def rpush(self, key: str, *values: str):
+        return await self.execute("RPUSH", key, *values)
+
+    async def lpush(self, key: str, *values: str):
+        return await self.execute("LPUSH", key, *values)
+
+    async def llen(self, key: str) -> int:
+        r = await self.execute("LLEN", key)
+        return int(r or 0)
+
+    async def lrange(self, key: str, start: int, stop: int) -> List[str]:
+        r = await self.execute("LRANGE", key, start, stop)
+        return [] if not r else [str(x) for x in r]
+
+    async def lpop(self, key: str) -> Optional[str]:
+        r = await self.execute("LPOP", key)
+        return None if r is None else str(r)
+
+    async def lindex(self, key: str, index: int) -> Optional[str]:
+        r = await self.execute("LINDEX", key, index)
+        return None if r is None else str(r)
+
+    async def scan(self, cursor: str = "0", match: Optional[str] = None, count: int = 10):
+        cmd = ["SCAN", cursor]
+        if match:
+            cmd += ["MATCH", match]
+        if count:
+            cmd += ["COUNT", int(count)]
+        r = await self.execute(*cmd)
+        if not r:
+            return "0", []
+        cur = str(r[0])
+        keys = [str(x) for x in r[1]] if len(r) > 1 and isinstance(r[1], list) else []
+        return cur, keys
+
+    async def ttl(self, key: str) -> Optional[int]:
+        r = await self.execute("TTL", key)
+        try:
+            return int(r)
+        except Exception:
+            return None
+
+    async def hmset(self, key: str, mapping: dict):
+        parts = ["HMSET", key]
+        for f, v in mapping.items():
+            parts.extend([str(f), str(v)])
+        return await self.execute(*parts)
+
+    async def hget(self, key: str, field: str):
+        return await self.execute("HGET", key, field)
+
+    async def hgetall(self, key: str):
+        r = await self.execute("HGETALL", key)
+        if not r:
+            return {}
+        it = iter(r)
+        out = {}
+        for f, v in zip(it, it):
+            out[str(f)] = str(v)
+        return out
+
+    async def hdel(self, key: str, *fields: str):
+        return await self.execute("HDEL", key, *fields)
+
+    async def zadd(self, key: str, score: float, member: str):
+        return await self.execute("ZADD", key, score, member)
+
+    async def zrem(self, key: str, *members: str):
+        return await self.execute("ZREM", key, *members)
+
+    async def zrange(self, key: str, start: int, stop: int, withscores=False):
+        if withscores:
+            r = await self.execute("ZRANGE", key, start, stop, "WITHSCORES")
+            out = []
+            it = iter(r)
+            for m, s in zip(it, it):
+                out.append((str(m), float(s)))
+            return out
+        else:
+            r = await self.execute("ZRANGE", key, start, stop)
+            return [] if not r else [str(x) for x in r]
+
+    async def zrangebyscore(self, key: str, min_v: str, max_v: str, withscores=False):
+        if withscores:
+            r = await self.execute("ZRANGEBYSCORE", key, min_v, max_v, "WITHSCORES")
+            out = []
+            it = iter(r)
+            for m, s in zip(it, it):
+                out.append((str(m), float(s)))
+            return out
+        else:
+            r = await self.execute("ZRANGEBYSCORE", key, min_v, max_v)
+            return [] if not r else [str(x) for x in r]
+
+    async def publish(self, channel: str, message: str):
+        return await self.execute("PUBLISH", channel, message)
+
+class AsyncRedisPubSubWS:
+    """
+    Conexão dedicada a Pub/Sub via RESP-over-WS.
+    """
+    def __init__(self, url: str, token: str = ""):
+        self.url = f"{url}?token={token}" if token else url
+        self._ws: Optional[websockets.WebSocketClientProtocol] = None
+
+    async def connect(self):
+        if self._ws and not getattr(self._ws, "closed", False):
+            return
+        dbg("[redis-pubsub] connecting ->", self.url)
+        self._ws = await websockets.connect(self.url, max_size=None)
+        dbg("[redis-pubsub] connected")
+
+    async def aclose(self):
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+                dbg("[redis-pubsub] closed")
+            except Exception as e:
+                dbg("[redis-pubsub] close error:", repr(e))
+            self._ws = None
+
+    def _enc(self, *parts: Union[str, bytes, int, float]) -> bytes:
+        out = bytearray()
+        out.extend(f"*{len(parts)}\r\n".encode())
+        for p in parts:
+            s = p if isinstance(p, (bytes, bytearray)) else str(p).encode()
+            out.extend(f"${len(s)}\r\n".encode()); out.extend(s); out.extend(b"\r\n")
+        return bytes(out)
+
+    async def _send(self, *parts):
+        if not self._ws or getattr(self._ws, "closed", False):
+            await self.connect()
+        await self._ws.send(self._enc(*parts))
+
+    async def subscribe(self, *channels: str):
+        if not channels:
+            return
+        dbg("[redis-pubsub] SUBSCRIBE", channels)
+        await self._send("SUBSCRIBE", *channels)
+
+    async def psubscribe(self, *patterns: str):
+        if not patterns:
+            return
+        dbg("[redis-pubsub] PSUBSCRIBE", patterns)
+        await self._send("PSUBSCRIBE", *patterns)
+
+    async def read_message(self) -> Optional[Dict[str, Any]]:
+        """
+        Retorna:
+          {"type":"message","channel": "...", "payload": "..."}
+          {"type":"pmessage","pattern":"...", "channel": "...", "payload": "..."}
+          {"type":"subscribe"|...}
+        """
+        if not self._ws or getattr(self._ws, "closed", False):
+            await self.connect()
+        data = await self._ws.recv()
+        if not isinstance(data, (bytes, bytearray)):
+            data = str(data).encode()
+        text = data.decode(errors="replace")
+        parts = text.split("\r\n")
+        if not parts or not parts[0].startswith("*"):
+            return None
+        try:
+            elems = []
+            i = 1
+            while i < len(parts):
+                line = parts[i]
+                if line.startswith("$"):
+                    i += 1
+                    if i < len(parts):
+                        elems.append(parts[i])
+                i += 1
+            if not elems:
+                return None
+            kind = elems[0]
+            if kind == "message" and len(elems) >= 3:
+                return {"type": "message", "channel": elems[1], "payload": elems[2]}
+            if kind == "pmessage" and len(elems) >= 4:
+                return {"type": "pmessage","pattern": elems[1],"channel": elems[2],"payload": elems[3]}
+            return {"type": kind, "elems": elems}
+        except Exception:
+            return None
 
 # ===================== CONFIG =====================
 
-# Conexão direta via WebSocket
 REDIS_WS_URL = os.getenv("REDIS_WS_URL", "wss://redisrender.onrender.com")
-REDIS_TOKEN = os.getenv("REDIS_TOKEN", "")
+REDIS_TOKEN  = os.getenv("REDIS_TOKEN", "")
 
 REDIS_LOG_NS = os.getenv("REDIS_LOG_NS", "iss")
-PREQUEUE_NS = os.getenv("PREQUEUE_NS", f"{REDIS_LOG_NS}:y")
+PREQUEUE_NS  = os.getenv("PREQUEUE_NS", f"{REDIS_LOG_NS}:y")
 PREQUEUE_COLABS_SET = f"{PREQUEUE_NS}:colabs"
 
 FRONT_LAST_RUN_KEY = f"{REDIS_LOG_NS}:front:last_run_ts"
-
-# Flag apenas informativa para o front (sempre false agora)
-ARQ_ENABLED = False
-
-# ===================== SESSÕES =====================
+ARQ_ENABLED = False  # informativo
 
 SESSION_COOKIE_NAME = os.getenv("FRONT_SESSION_COOKIE", "iss_front_session")
 SESSION_TTL = int(os.getenv("FRONT_SESSION_TTL", "86400"))  # 1 dia
 
 # ===================== HELPERS =====================
 
-
 def runs_key_for(tenant: str) -> str:
     return f"{REDIS_LOG_NS}:front:{tenant}:runs"
-
 
 def session_key(token: str) -> str:
     return f"{REDIS_LOG_NS}:front:sess:{token}"
 
-
 def cnpj_digits(cnpj: str) -> str:
     d = "".join(filter(str.isdigit, cnpj))[-14:]
-    return d.zfill(14) if d else "0" * 14
-
+    return d.zfill(14) if d else "0"*14
 
 def mask_cnpj(cnpj: str) -> str:
     d = cnpj_digits(cnpj)
     return f"{d[0:2]}.{d[2:5]}.{d[5:8]}/{d[8:12]}-{d[12:14]}"
 
-
 def slugify(value: str) -> str:
-    import re
-    import unicodedata
-
+    import re, unicodedata
     value = (value or "").strip().lower()
-    value = unicodedata.normalize("NFKD", value)
-    value = value.encode("ascii", "ignore").decode("ascii")
+    value = unicodedata.normalize("NFKD", value).encode("ascii","ignore").decode("ascii")
     value = re.sub(r"[^a-z0-9]+", "_", value)
     return value.strip("_") or "colab"
-
 
 def task_logs_key(job_id: str) -> str:
     return f"{REDIS_LOG_NS}:task:{job_id}:logs"
 
-
 def extract_meta(function: str, args: List[Any], kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Extrai metadados a partir do function/args usados nos jobs.
-    """
-    meta = {
-        "cnpj": "",
-        "colaborador": "",
-        "colaborador_norm": "",
-        "mes": "",
-        "etapa": function or "",
-    }
+    meta = {"cnpj":"", "colaborador":"", "colaborador_norm":"", "mes":"", "etapa": function or ""}
     try:
         if function == "job_notas" and len(args) >= 4:
             colab_norm, cnpj, mes = str(args[0]), str(args[1]), str(args[2])
-            meta.update(
-                {
-                    "colaborador_norm": colab_norm,
-                    "colaborador": colab_norm,
-                    "cnpj": cnpj,
-                    "mes": mes,
-                    "etapa": "notas",
-                }
-            )
+            meta.update({"colaborador_norm": colab_norm, "colaborador": colab_norm, "cnpj": cnpj, "mes": mes, "etapa": "notas"})
         elif function == "job_escrituracao" and len(args) >= 4:
             colab_norm, cnpj, mes = str(args[0]), str(args[1]), str(args[2])
-            meta.update(
-                {
-                    "colaborador_norm": colab_norm,
-                    "colaborador": colab_norm,
-                    "cnpj": cnpj,
-                    "mes": mes,
-                    "etapa": "escrituracao",
-                }
-            )
+            meta.update({"colaborador_norm": colab_norm, "colaborador": colab_norm, "cnpj": cnpj, "mes": mes, "etapa": "escrituracao"})
         elif function == "job_certidao" and len(args) >= 4:
             colab_norm, cnpj, mes = str(args[0]), str(args[1]), str(args[2])
-            meta.update(
-                {
-                    "colaborador_norm": colab_norm,
-                    "colaborador": colab_norm,
-                    "cnpj": cnpj,
-                    "mes": mes,
-                    "etapa": "certidao",
-                }
-            )
+            meta.update({"colaborador_norm": colab_norm, "colaborador": colab_norm, "cnpj": cnpj, "mes": mes, "etapa": "certidao"})
         elif function == "job_dam" and len(args) >= 3:
             colab_norm, cnpj = str(args[0]), str(args[1])
-            meta.update(
-                {
-                    "colaborador_norm": colab_norm,
-                    "colaborador": colab_norm,
-                    "cnpj": cnpj,
-                    "etapa": "dam",
-                }
-            )
+            meta.update({"colaborador_norm": colab_norm, "colaborador": colab_norm, "cnpj": cnpj, "etapa": "dam"})
     except Exception:
         pass
     return meta
 
+def detect_etapa_from_logs(lines: List[str]) -> str:
+    for line in lines:
+        s = (line or "").lower()
+        if "job_escrituracao" in s: return "escrituracao"
+        if "job_notas" in s:        return "notas"
+        if "job_certidao" in s:     return "certidao"
+        if "job_dam" in s:          return "dam"
+    return ""
 
-STATUS_PRIORITY = {
-    "pending": 0,
-    "waiting": 1,
-    "queued": 2,
-    "running": 3,
-    "success": 4,
-    "error": 4,
-}
+def detect_job_status_from_logs(lines: List[str]) -> str:
+    if not lines:
+        return "pending"
+    lower_lines = [(l or "").lower() for l in lines]
+    joined = "\n".join(lower_lines)
+    if any("=== fim" in l and "ok" in l for l in lower_lines): return "success"
+    if "'status': 'ok'" in joined or '"status": "ok"' in joined: return "success"
+    if "finalizado" in joined or "concluído" in joined or "concluido" in joined: return "success"
+    ERROR_TOKENS = [" erro ", "error", "exception", "traceback", "loginerror", "cnpjinexistenteerror", "cnpjmismatcherror"]
+    if any(tok in joined for tok in ERROR_TOKENS): return "error"
+    return "running"
 
-
+STATUS_PRIORITY = {"pending":0,"waiting":1,"queued":2,"running":3,"success":4,"error":4}
 def merge_status(current: str, new: str) -> str:
-    if STATUS_PRIORITY.get(new, 0) >= STATUS_PRIORITY.get(current, 0):
-        return new
-    return current
-
+    return new if STATUS_PRIORITY.get(new,0) >= STATUS_PRIORITY.get(current,0) else current
 
 # ===================== APP =====================
 
-app = FastAPI(title="ISS Queue Front (Cliente) — WS only, sem ARQ")
+app = FastAPI(title="ISS Queue Front (Cliente) — WS-only (Render)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -173,14 +466,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 def rds() -> AsyncRedisWS:
-    return app.state.redis  # tipo AsyncRedisWS
-
+    # cliente de comandos (REST, leituras, gravações)
+    return getattr(app.state, "redis_cmd", None)
 
 async def get_session_from_request(request: Request) -> Optional[Dict[str, Any]]:
-    rd: Optional[AsyncRedisWS] = getattr(app.state, "redis", None)
+    rd: Optional[AsyncRedisWS] = getattr(app.state, "redis_cmd", None)
     if rd is None:
+        dbg("get_session_from_request: redis_cmd not ready")
         return None
     token = request.cookies.get(SESSION_COOKIE_NAME)
     if not token:
@@ -192,6 +485,120 @@ async def get_session_from_request(request: Request) -> Optional[Dict[str, Any]]
         return json.loads(raw)
     except Exception:
         return None
+
+# ===================== AUTH MIDDLEWARE =====================
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    path = request.url.path
+    if path in ("/login", "/logout", "/") or path.startswith("/openapi") or path.startswith("/docs") or path.startswith("/redoc"):
+        return await call_next(request)
+
+    if path == "/" or path.startswith("/api") or path.startswith("/ws"):
+        sess = await get_session_from_request(request)
+        if not sess:
+            if path.startswith("/api"):
+                dbg("auth_middleware: 401 on", path)
+                return JSONResponse({"detail": "Não autenticado"}, status_code=401)
+        else:
+            request.state.session = sess
+    return await call_next(request)
+
+# ===================== STARTUP / SHUTDOWN =====================
+
+@app.on_event("startup")
+async def startup():
+    # 1) comandos
+    app.state.redis_cmd = AsyncRedisWS(REDIS_WS_URL, token=REDIS_TOKEN, name="cmd")
+    await app.state.redis_cmd.connect()
+
+
+    # 3) scheduler (isolado)
+    app.state.redis_scheduler = AsyncRedisWS(REDIS_WS_URL, token=REDIS_TOKEN, name="sched")
+    await app.state.redis_scheduler.connect()
+
+    dbg("[startup] Redis WS OK (cmd/pubsub/sched)")
+    asyncio.create_task(scheduler_y_to_arq())
+
+@app.on_event("shutdown")
+async def shutdown():
+    try:
+        await app.state.redis_cmd.aclose()
+    except Exception:
+        pass
+    try:
+        await app.state.redis_pubsub.aclose()
+    except Exception:
+        pass
+    try:
+        await app.state.redis_scheduler.aclose()
+    except Exception:
+        pass
+    print("Shutdown concluído (WS fechados).")
+
+# ===================== RUNS PERSISTÊNCIA =====================
+
+async def load_runs(rd: AsyncRedisWS, tenant: str) -> Dict[str, Dict[str, Any]]:
+    if not tenant:
+        return {}
+    raw = await rd.get(runs_key_for(tenant))
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+async def save_runs(rd: AsyncRedisWS, tenant: str, data: Dict[str, Dict[str, Any]]):
+    if not tenant:
+        return
+    await rd.set(runs_key_for(tenant), json.dumps(data))
+
+# ===================== HTML LOGIN =====================
+
+PAGE_LOGIN = """<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Prumo Sistemas — Login ISS Front (Cliente)</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"/>
+  <style>body{background:#f8f9fa;min-height:100vh;display:flex;align-items:center;justify-content:center;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}.login-card{max-width:420px;width:100%;border-radius:.75rem;box-shadow:0 .5rem 1rem rgba(0,0,0,.08)}</style>
+</head>
+<body>
+  <div class="card login-card">
+    <div class="card-body p-4">
+      <h1 class="h5 mb-3 text-center">Prumo Sistemas — ISS Front</h1>
+      <p class="text-muted small text-center mb-4">Informe o nome do colaborador e a senha padrão para acessar o painel.</p>
+      <form method="post" action="/login" autocomplete="off">
+        <div class="mb-3">
+          <label class="form-label small text-muted">Colaborador</label>
+          <input class="form-control" name="colaborador" placeholder="Ex.: João da Silva" required>
+        </div>
+        <div class="mb-3">
+          <label class="form-label small text-muted">Senha</label>
+          <input type="password" class="form-control" name="senha" placeholder="123456" required>
+        </div>
+        <div class="d-grid"><button class="btn btn-primary" type="submit">Entrar</button></div>
+        <div id="erroLogin" class="text-danger small mt-3 text-center" style="display:none;">Usuário ou senha incorretos.</div>
+      </form>
+    </div>
+  </div>
+<script>
+  document.querySelector("form").addEventListener("submit", async function (e) {
+    e.preventDefault();
+    const form = e.target;
+    const formData = new FormData(form);
+    const erroEl = document.getElementById("erroLogin");
+    erroEl.style.display = "none";
+    const resp = await fetch("/login", { method: "POST", body: formData });
+    if (resp.status === 200 || resp.status === 303) { window.location.href = "/"; return; }
+    if (resp.status === 401) { erroEl.style.display = "block"; }
+  });
+</script>
+</body>
+</html>
+"""
 
 
 # ===================== HTML LOGIN =====================
@@ -243,89 +650,7 @@ PAGE_LOGIN = """<!doctype html>
 </html>
 """
 
-# ATENÇÃO: PAGE_CLIENT (HTML principal do painel) continua igual ao seu código anterior.
-# Aqui assumimos que ela já está definida em outro trecho do arquivo original:
-# PAGE_CLIENT = "..."
-
-
-# ===================== AUTH MIDDLEWARE =====================
-
-
-@app.middleware("http")
-async def auth_middleware(request: Request, call_next):
-    path = request.url.path
-    if (
-        path.startswith("/docs")
-        or path.startswith("/openapi")
-        or path.startswith("/redoc")
-        or path.startswith("/static")
-        or path in ("/login", "/logout")
-    ):
-        return await call_next(request)
-
-    if path == "/" or path.startswith("/api"):
-        sess = await get_session_from_request(request)
-        if not sess:
-            if path.startswith("/api"):
-                return JSONResponse({"detail": "Não autenticado"}, status_code=401)
-            else:
-                return HTMLResponse(PAGE_LOGIN)
-        request.state.session = sess
-    return await call_next(request)
-
-
-# ===================== STARTUP / SHUTDOWN =====================
-
-
-@app.on_event("startup")
-async def startup():
-    # Conecta direto por WebSocket
-    app.state.redis = AsyncRedisWS(REDIS_WS_URL, token=REDIS_TOKEN)
-    try:
-        await app.state.redis.connect()
-        ok = await app.state.redis.ping()
-        if ok:
-            print(f"[startup] Conectado ao Redis via WebSocket: {REDIS_WS_URL}")
-        else:
-            print(f"[startup] ERRO: ping falhou em {REDIS_WS_URL}")
-    except Exception as e:
-        print(f"[startup] ERRO WS {REDIS_WS_URL}: {e!r}")
-
-    asyncio.create_task(scheduler_y_to_arq())
-
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    try:
-        await app.state.redis.aclose()
-    except Exception:
-        pass
-    print("Shutdown concluído (WS fechado).")
-
-
-# ===================== RUNS PERSISTÊNCIA =====================
-
-
-async def load_runs(rd: AsyncRedisWS, tenant: str) -> Dict[str, Dict[str, Any]]:
-    if not tenant:
-        return {}
-    raw = await rd.get(runs_key_for(tenant))
-    if not raw:
-        return {}
-    try:
-        return json.loads(raw)
-    except Exception:
-        return {}
-
-
-async def save_runs(rd: AsyncRedisWS, tenant: str, data: Dict[str, Dict[str, Any]]):
-    if not tenant:
-        return
-    await rd.set(runs_key_for(tenant), json.dumps(data))
-
-
-# ===================== ROTAS =====================
+# ===================== HTML CLIENT =====================
 
 PAGE_CLIENT = """<!doctype html>
 <html lang="pt-br">
@@ -891,8 +1216,13 @@ PAGE_CLIENT = """<!doctype html>
     let STORAGE_KEY_ACCOUNTS = '';
     let STORAGE_KEY_CNPJS = '';
 
-    // NOVO: controle de refresh periódico dos logs
+    // LOG refresh periódico dentro do modal
     let LOG_REFRESH_INTERVAL = null;
+
+    // NOVO: WebSocket de status / logs em tempo real
+    let STATUS_WS = null;
+    let WS_RETRY_MS = 1000;
+    let CURRENT_RUNS = {};
 
     function initStorageKeys(colabNorm) {
       const base = 'iss_front_' + (colabNorm || 'default') + '_';
@@ -1073,7 +1403,6 @@ PAGE_CLIENT = """<!doctype html>
 
         return out.join("\\n").trim();
     }
-
 
     // ====================== FIM HIGIENIZAÇÃO ======================
 
@@ -1272,7 +1601,6 @@ PAGE_CLIENT = """<!doctype html>
         tr.dataset.runId = r.run_id;
         tr.dataset.cnpjDigits = r.cnpj_digits;
 
-        // Preenche razão/conta usando o localStorage
         const localCnpj = findLocalCnpj(r.cnpj_digits);
         let razao = r.razao || '';
         let conta = r.conta || '';
@@ -1311,7 +1639,6 @@ PAGE_CLIENT = """<!doctype html>
     }
 
     async function loadAll() {
-      // dados locais
       loadFromLocal();
       renderAccounts();
       renderCnpjs();
@@ -1333,13 +1660,60 @@ PAGE_CLIENT = """<!doctype html>
           fetchJSON('/api/kpis'),
           fetchJSON('/api/status'),
         ]);
-        applyKpis(kpisData);        // atualiza kpi-box
-        renderStatusTable(statusData); // atualiza tabela
+        applyKpis(kpisData);
+        renderStatusTable(statusData);
       } catch (e) {
         console.error(e);
       }
     }
 
+    // ====================== WEBSOCKET STATUS/LOGS ======================
+
+    function connectWS() {
+      if (STATUS_WS && (STATUS_WS.readyState === WebSocket.OPEN || STATUS_WS.readyState === WebSocket.CONNECTING)) {
+        return;
+      }
+      const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+      STATUS_WS = new WebSocket(proto + '://' + window.location.host + '/ws');
+
+      STATUS_WS.onopen = () => {
+        console.log('[WS] conectado');
+        WS_RETRY_MS = 1000;
+      };
+
+      STATUS_WS.onmessage = (ev) => {
+        let msg;
+        try {
+          msg = JSON.parse(ev.data);
+        } catch {
+          return;
+        }
+        if (msg.type === 'hello') {
+          console.log('[WS] hello tenant=', msg.tenant);
+        } else if (msg.type === 'runs') {
+          CURRENT_RUNS = msg.runs || {};
+        } else if (msg.type === 'status') {
+          applyKpis({ kpis: msg.kpis || {} });
+          renderStatusTable({ rows: msg.rows || [] });
+        } else if (msg.type === 'log') {
+          // opcional: exibir log em tempo real em alguma área
+          // console.log('[WS LOG]', msg.job_id, msg.line);
+        } else if (msg.type === 'ping') {
+          // ignore
+        }
+      };
+
+      STATUS_WS.onclose = () => {
+        console.log('[WS] fechado, tentando reconectar...');
+        STATUS_WS = null;
+        setTimeout(connectWS, WS_RETRY_MS);
+        WS_RETRY_MS = Math.min(WS_RETRY_MS * 2, 10000);
+      };
+
+      STATUS_WS.onerror = () => {
+        try { STATUS_WS.close(); } catch (e) {}
+      };
+    }
 
     // ========= AÇÕES DE FORMULÁRIO DE CONTA (LOCALSTORAGE) =========
     document.getElementById('form-account').addEventListener('submit', (e) => {
@@ -1388,7 +1762,6 @@ PAGE_CLIENT = """<!doctype html>
       } else if (delId) {
         if (!confirm('Remover conta? CNPJs que apontarem para ela ficarão sem conta.')) return;
         delete ACCS[delId];
-        // remove account_id dessa conta dos CNPJs
         Object.values(CNPJS).forEach(c => {
           if (c.account_id === delId) c.account_id = '';
         });
@@ -1469,9 +1842,9 @@ PAGE_CLIENT = """<!doctype html>
       statusEl.textContent = 'Importando...';
       try {
         const resp = await fetchJSON('/api/import_cnpjs', { method: 'POST', body: fd });
-        const list = resp.cnpjs || [];
+        const list = resp.cnpjs || {};
         let imported = 0;
-        list.forEach(row => {
+        (list || []).forEach(row => {
           const id = genId();
           CNPJS[id] = {
             id,
@@ -1569,10 +1942,8 @@ PAGE_CLIENT = """<!doctype html>
 
     // === Download ZIP real ===
     document.getElementById('btn-download').addEventListener('click', () => {
-      // Navega direto para a rota que devolve o FileResponse (ZIP)
       window.location.href = '/api/download_zip';
     });
-
 
     // === Logs modal (por EXECUÇÃO / JOB / CNPJ) ===
     const logFilterSelect = document.getElementById('log-filter-etapa');
@@ -1580,7 +1951,6 @@ PAGE_CLIENT = """<!doctype html>
     const logsStatusSummary = document.getElementById('logs-status-summary');
     const modalLogsEl = document.getElementById('modalLogs');
 
-    // função reutilizada para aplicar o filtro atual em cima do FULL_LOG_TEXT
     function applyLogFilter() {
       const selectedEtapa = logFilterSelect.value;
 
@@ -1609,20 +1979,18 @@ PAGE_CLIENT = """<!doctype html>
       if (!btn) return;
 
       const runId = btn.getAttribute('data-run-id');
-      const jobId = btn.getAttribute('data-job-id');  // fallback legacy
+      const jobId = btn.getAttribute('data-job-id');
       const cnpjDigitsAttr = btn.getAttribute('data-cnpj');
 
       logsStatusSummary.innerHTML = '';
       logContentElement.textContent = 'Carregando...';
       FULL_LOG_TEXT = '';
 
-      // limpa qualquer intervalo anterior
       if (LOG_REFRESH_INTERVAL) {
         clearInterval(LOG_REFRESH_INTERVAL);
         LOG_REFRESH_INTERVAL = null;
       }
 
-      // função que realmente busca e atualiza os logs
       const loadLogs = async () => {
         try {
           let data;
@@ -1677,7 +2045,6 @@ PAGE_CLIENT = """<!doctype html>
               </div>
             </div>`;
 
-          // HIGIENIZA LOGS ANTES DE EXIBIR
           FULL_LOG_TEXT = sanitizeLogText(data.logs || '');
           applyLogFilter();
         } catch (err) {
@@ -1685,15 +2052,12 @@ PAGE_CLIENT = """<!doctype html>
         }
       };
 
-      // primeira carga
       await loadLogs();
-      // e agora refresh automático a cada 3 segundos ENQUANTO o modal estiver aberto
       LOG_REFRESH_INTERVAL = setInterval(() => {
         loadLogs().catch(() => {});
       }, 3000);
     });
 
-    // limpa o intervalo e estado quando o modal é fechado
     modalLogsEl.addEventListener('hidden.bs.modal', () => {
       if (LOG_REFRESH_INTERVAL) {
         clearInterval(LOG_REFRESH_INTERVAL);
@@ -1735,42 +2099,48 @@ PAGE_CLIENT = """<!doctype html>
       window.location.href = '/logout';
     });
 
-    // Carrega usuário logado, inicializa storage por colaborador e começa loop
+    // Carrega usuário logado, inicializa storage por colaborador e começa loop + WS
     fetchJSON('/api/me').then(data => {
       if (data && data.colaborador && navUsernameEl) {
         navUsernameEl.textContent = data.colaborador;
       }
       initStorageKeys((data && data.colaborador_norm) || 'default');
-      loadAll();
-      setInterval(loadStatus, 5000);
+      loadAll();     // snapshot inicial via REST
+      connectWS();   // tempo real via WS
+      // fallback: se WS morrer, ainda fazemos um refresh leve
+      setInterval(() => {
+        if (!STATUS_WS || STATUS_WS.readyState !== WebSocket.OPEN) {
+          loadStatus();
+        }
+      }, 30000);
     }).catch(() => {
       initStorageKeys('default');
       loadAll();
-      setInterval(loadStatus, 5000);
+      connectWS();
+      setInterval(() => {
+        if (!STATUS_WS || STATUS_WS.readyState !== WebSocket.OPEN) {
+          loadStatus();
+        }
+      }, 30000);
     });
   });
 </script>
 </body>
 </html>
 """
+# ===================== ROTAS (REST) =====================
 
-@app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    # PAGE_CLIENT deve estar definida no seu código original
-    return HTMLResponse(PAGE_CLIENT)
+@app.get("/")
+async def root():
+    return HTMLResponse(PAGE_CLIENT.replace("REPLACE_WITH_YOUR_FULL_PAGE_CLIENT_HTML", ""), media_type="text/html")
 
-
-@app.get("/login", response_class=HTMLResponse)
-async def login_page(request: Request):
-    sess = await get_session_from_request(request)
-    if sess:
-        return RedirectResponse("/", status_code=303)
-    return HTMLResponse(PAGE_LOGIN)
-
+@app.get("/login")
+async def login_page():
+    return HTMLResponse(PAGE_LOGIN, media_type="text/html")
 
 @app.post("/login")
 async def do_login(request: Request):
-    rd = rds()
+    rd = app.state.redis_cmd
     form = await request.form()
     colaborador = (form.get("colaborador") or "").strip().lower()
     senha = form.get("senha") or ""
@@ -1787,64 +2157,81 @@ async def do_login(request: Request):
         "laryssa": "123456",
     }
     if colaborador not in validUsers or validUsers[colaborador] != senha:
-        return HTMLResponse(PAGE_LOGIN, status_code=401)
+        dbg("[login] inválido para", colaborador)
+        raise HTTPException(401, "Usuário/senha inválidos")
 
     token = uuid.uuid4().hex
-    sess_data = {
-        "colaborador": colaborador,
-        "colaborador_norm": slugify(colaborador),
-        "created_at": time.time(),
-    }
+    sess_data = {"colaborador": colaborador, "colaborador_norm": slugify(colaborador), "created_at": time.time()}
     await rd.set(session_key(token), json.dumps(sess_data), ex=SESSION_TTL)
 
-    resp = RedirectResponse("/", status_code=303)
-    resp.set_cookie(
-        key=SESSION_COOKIE_NAME,
-        value=token,
-        max_age=SESSION_TTL,
-        httponly=True,
-        samesite="lax",
-    )
-    return resp
+    dbg("[login] ok para", colaborador, "token", token[:8]+"…")
 
+    resp = JSONResponse({"status": "ok", "colaborador": colaborador})
+    resp.set_cookie(key=SESSION_COOKIE_NAME, value=token, max_age=SESSION_TTL, httponly=True, samesite="lax")
+    return resp
 
 @app.get("/logout")
 async def logout(request: Request):
-    rd = rds()
+    rd = app.state.redis_cmd
     token = request.cookies.get(SESSION_COOKIE_NAME)
-    resp = RedirectResponse("/login", status_code=303)
+    resp = JSONResponse({"status": "ok"})
     if token:
         try:
             await rd.delete(session_key(token))
-        except Exception:
-            pass
+            dbg("[logout] sessão removida", token[:8]+"…")
+        except Exception as e:
+            dbg("[logout] erro ao deletar sessão:", repr(e))
         resp.delete_cookie(SESSION_COOKIE_NAME)
     return resp
-
 
 @app.get("/api/me")
 async def api_me(request: Request):
     sess = getattr(request.state, "session", None) or await get_session_from_request(request)
     if not sess:
         raise HTTPException(401, "Não autenticado")
-    return {
-        "colaborador": sess.get("colaborador", ""),
-        "colaborador_norm": sess.get("colaborador_norm", ""),
-    }
+    return {"colaborador": sess.get("colaborador", ""), "colaborador_norm": sess.get("colaborador_norm", "")}
 
+# --------- NOVO: import XLSX (para evitar 404) ---------
+@app.post("/api/import_cnpjs")
+async def api_import_cnpjs(account_id: str = Form(...), file: UploadFile = File(...)):
+    """
+    Espera colunas: CNPJ, Razão Social, Código Domínio
+    """
+    dbg("[import] recebendo arquivo:", file.filename, "para account:", account_id)
+    try:
+        from openpyxl import load_workbook
+    except Exception as e:
+        dbg("[import] openpyxl ausente:", repr(e))
+        raise HTTPException(500, "Dependência 'openpyxl' não instalada no servidor.")
+
+    try:
+        content = await file.read()
+        from io import BytesIO
+        wb = load_workbook(BytesIO(content), read_only=True, data_only=True)
+        ws = wb.active
+        headers = []
+        rows_out = []
+
+        for i, row in enumerate(ws.iter_rows(values_only=True), start=1):
+            if i == 1:
+                headers = [str(x or "").strip().lower() for x in row]
+                continue
+            record = {headers[j]: (row[j] if j < len(row) else "") for j in range(len(headers))}
+            cnpj = str(record.get("cnpj") or record.get("cnpjs") or "").strip()
+            razao = str(record.get("razão social") or record.get("razao social") or record.get("razao") or "").strip()
+            dominio = str(record.get("código domínio") or record.get("codigo dominio") or record.get("dominio") or "").strip()
+            if not cnpj:
+                continue
+            rows_out.append({"cnpj": cnpj, "razao": razao, "dominio": dominio})
+        dbg(f"[import] linhas extraídas: {len(rows_out)}")
+        return {"cnpjs": rows_out}
+    except Exception as e:
+        dbg("[import] erro:", repr(e))
+        raise HTTPException(500, f"Falha ao ler XLSX: {e}")
 
 @app.post("/api/enqueue")
 async def api_enqueue(request: Request, payload: Dict[str, Any]):
-    """
-    Enfileira jobs na PRÉ-FILA Y, por colaborador.
-
-    - Cada job vira um JSON `env` armazenado em:
-        iss:y:colab:<colaborador_norm>  (RPUSH)
-    - E o colaborador é registrado em:
-        iss:y:colabs                     (SADD)
-    """
-    rd = rds()
-
+    rd = app.state.redis_cmd
     sess = getattr(request.state, "session", None) or await get_session_from_request(request)
     if not sess:
         raise HTTPException(401, "Não autenticado")
@@ -1872,132 +2259,77 @@ async def api_enqueue(request: Request, payload: Dict[str, Any]):
     mes_str = f"{mes}/{ano}"
     tipo_estrutura = "dominio" if formato_dominio else "convencional"
 
-    func_map = {
-        "escrituracao": "job_escrituracao",
-        "notas": "job_notas",
-        "dam": "job_dam",
-        "certidao": "job_certidao",
-    }
+    func_map = {"escrituracao":"job_escrituracao","notas":"job_notas","dam":"job_dam","certidao":"job_certidao"}
 
     total_jobs = 0
     used_cnpjs = set()
 
     for cid in cnpj_ids:
         c = cnps.get(cid)
-        if not c:
-            continue
+        if not c: continue
 
         account_id = c.get("account_id") or ""
         acc = accs.get(account_id)
-        if not acc:
-            continue
+        if not acc: continue
 
         usuario = (acc.get("user") or "").strip()
         senha = acc.get("password") or ""
-        if not usuario or not senha:
-            continue
+        if not usuario or not senha: continue
 
         colaborador_norm = tenant
         cd = cnpj_digits(str(c.get("cnpj") or ""))
-        if not cd or cd == "0" * 14:
-            continue
+        if not cd or cd == "0"*14: continue
 
         used_cnpjs.add(cd)
 
         run_id = uuid.uuid4().hex
         run_job_ids: List[str] = []
-        run_etapas_flags = {
-            "escrituracao": False,
-            "notas": False,
-            "dam": False,
-            "certidao": False,
-        }
+        run_etapas_flags = {"escrituracao": False, "notas": False, "dam": False, "certidao": False}
 
         codigo_dom = (c.get("dominio") or "").strip() or None
 
         for etapa_key, enabled in etapas.items():
-            if not enabled:
-                continue
+            if not enabled: continue
             func = func_map.get(etapa_key)
-            if not func:
-                continue
+            if not func: continue
 
             if func == "job_notas":
-                args = [
-                    colaborador_norm,
-                    cd,
-                    mes_str,
-                    usuario,
-                    senha,
-                    tipo_estrutura,
-                    codigo_dom,
-                ]
+                args = [colaborador_norm, cd, mes_str, usuario, senha, tipo_estrutura, codigo_dom]
             else:
-                args = [
-                    colaborador_norm,
-                    cd,
-                    mes_str,
-                    usuario,
-                    senha,
-                    tipo_estrutura,
-                ]
+                args = [colaborador_norm, cd, mes_str, usuario, senha, tipo_estrutura]
 
             job_id = uuid.uuid4().hex
-            env = {
-                "func": func,
-                "args": args,
-                # Mantemos _job_id para identificação nos logs e front,
-                # mas não existe mais _queue_name/ARQ.
-                "enqueue_kwargs": {"_job_id": job_id},
-                "colaborador_norm": colaborador_norm,
-            }
+            env = {"func": func, "args": args, "enqueue_kwargs": {"_job_id": job_id}, "colaborador_norm": colaborador_norm}
 
             y_key = f"{PREQUEUE_NS}:colab:{colaborador_norm}"
             await rd.sadd(PREQUEUE_COLABS_SET, colaborador_norm)
             await rd.rpush(y_key, json.dumps(env))
             total_jobs += 1
-
             run_job_ids.append(job_id)
             run_etapas_flags[etapa_key] = True
 
         if run_job_ids:
             runs[run_id] = {
-                "id": run_id,
-                "cnpj": cd,
-                "mes": mes,
-                "ano": ano,
-                "mes_str": mes_str,
-                "etapas": run_etapas_flags,
-                "job_ids": run_job_ids,
-                "account_id": account_id,
-                "provider": provider,
-                "tipo_estrutura": tipo_estrutura,
-                "colaborador_norm": colaborador_norm,
+                "id": run_id, "cnpj": cd, "mes": mes, "ano": ano, "mes_str": mes_str,
+                "etapas": run_etapas_flags, "job_ids": run_job_ids, "account_id": account_id,
+                "provider": provider, "tipo_estrutura": tipo_estrutura, "colaborador_norm": colaborador_norm,
                 "created_at": time.time(),
             }
 
     if total_jobs == 0:
-        raise HTTPException(
-            400, "Nenhum job foi enfileirado (verifique senhas e contas)."
-        )
+        raise HTTPException(400, "Nenhum job foi enfileirado (verifique senhas e contas).")
 
     await save_runs(rd, tenant, runs)
+    await rd.publish(f"{REDIS_LOG_NS}:front:{tenant}:runs:updated", json.dumps(runs))
     await rd.set(FRONT_LAST_RUN_KEY, str(time.time()))
 
-    return {
-        "status": "ok",
-        "total_jobs": total_jobs,
-        "total_cnpjs": len(used_cnpjs),
-        "arq_enabled": ARQ_ENABLED,
-    }
-
+    dbg(f"[enqueue] tenant={tenant} jobs={total_jobs} cnpjs={len(used_cnpjs)} mes={mes_str}")
+    return {"status":"ok","total_jobs": total_jobs,"total_cnpjs": len(used_cnpjs),"arq_enabled": ARQ_ENABLED}
 
 @app.get("/api/kpis")
 async def api_kpis(request: Request):
-    rd = rds()
-    sess = getattr(request.state, "session", None) or await get_session_from_request(
-        request
-    )
+    rd = app.state.redis_cmd
+    sess = getattr(request.state, "session", None) or await get_session_from_request(request)
     if not sess:
         raise HTTPException(401, "Não autenticado")
     tenant = sess.get("colaborador_norm", "")
@@ -2009,8 +2341,7 @@ async def api_kpis(request: Request):
     for run in runs.values():
         cd = cnpj_digits(run.get("cnpj", ""))
         mes_str = run.get("mes_str") or ""
-        if not cd:
-            continue
+        if not cd: continue
         distinct_cnpjs.add(cd)
         key = f"{cd}:{mes_str}" if mes_str else cd
         rel_cnpjs[key] = {"cnpj": cd, "mes": mes_str}
@@ -2031,33 +2362,20 @@ async def api_kpis(request: Request):
     kpis["arq_enabled"] = ARQ_ENABLED
     return {"kpis": kpis}
 
+# ===================== STATUS INDEX =====================
 
-async def build_status_index(
-    relevant_cnpjs: Dict[str, Dict[str, Any]],
-    allowed_colab_prefix: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Monta índice de status por CNPJ/mes baseado:
-      - PRÉ-FILA Y (waiting)
-      - (sem ARQ agora; status de sucesso/erro podem ser inferidos via logs em endpoints específicos)
-    """
+async def build_status_index(relevant_cnpjs: Dict[str, Dict[str, Any]], allowed_colab_prefix: Optional[str] = None) -> Dict[str, Any]:
     rd: AsyncRedisWS = rds()
     job_events: Dict[str, Dict[str, Any]] = {}
     etapas = ["escrituracao", "notas", "dam", "certidao"]
 
     keys = list(relevant_cnpjs.keys())
     if not keys:
-        return {
-            "status_per_cnpj": {},
-            "job_events": {},
-            "kpis": {"running": 0, "queue": 0, "total_cnpjs": 0},
-        }
+        return {"status_per_cnpj": {}, "job_events": {}, "kpis": {"running": 0, "queue": 0, "total_cnpjs": 0}}
 
-    events: Dict[str, Dict[str, List[Dict[str, Any]]]] = {
-        k: {e: [] for e in etapas} for k in keys
-    }
+    events: Dict[str, Dict[str, List[Dict[str, Any]]]] = {k: {e: [] for e in etapas} for k in keys}
 
-    running_count = 0  # sem ARQ não sabemos quem está rodando
+    running_count = 0
     queue_count = 0
 
     def add_job_event(job_id: Optional[str], cd: str, mes: str, etapa: str, status: str):
@@ -2065,37 +2383,21 @@ async def build_status_index(
             return
         prev = job_events.get(job_id)
         if not prev:
-            job_events[job_id] = {
-                "cnpj": cd,
-                "mes": mes or "",
-                "etapa": etapa,
-                "status": status,
-            }
+            job_events[job_id] = {"cnpj": cd, "mes": mes or "", "etapa": etapa, "status": status}
         else:
             prev_status = prev.get("status", "pending")
             if STATUS_PRIORITY.get(status, 0) >= STATUS_PRIORITY.get(prev_status, 0):
-                prev.update(
-                    {
-                        "status": status,
-                        "cnpj": cd or prev.get("cnpj", ""),
-                        "mes": mes or prev.get("mes", ""),
-                        "etapa": etapa or prev.get("etapa", ""),
-                    }
-                )
+                prev.update({"status": status, "cnpj": cd or prev.get("cnpj", ""), "mes": mes or prev.get("mes", ""), "etapa": etapa or prev.get("etapa", "")})
 
     def append_to_event_maps(cd: str, mes: str, etapa: str, st_str: str, job_id: str):
         key1 = cd
         key2 = f"{cd}:{mes}" if mes else None
         if key2 and key2 in events:
-            events[key2].setdefault(etapa, []).append(
-                {"status": st_str, "job_id": job_id}
-            )
+            events[key2].setdefault(etapa, []).append({"status": st_str, "job_id": job_id})
         if key1 in events:
-            events[key1].setdefault(etapa, []).append(
-                {"status": st_str, "job_id": job_id}
-            )
+            events[key1].setdefault(etapa, []).append({"status": st_str, "job_id": job_id})
 
-    # --- Apenas PRÉ-FILA Y (waiting) ---
+    # 1) Pré-fila (waiting)
     try:
         colabs = await rd.smembers(PREQUEUE_COLABS_SET)
     except Exception:
@@ -2119,28 +2421,68 @@ async def build_status_index(
             mes = meta.get("mes", "") or ""
             etapa = meta["etapa"] or func
             colab_norm = meta.get("colaborador_norm") or ""
-            if allowed_colab_prefix and not str(colab_norm).startswith(
-                allowed_colab_prefix
-            ):
+            if allowed_colab_prefix and not str(colab_norm).startswith(allowed_colab_prefix):
                 continue
             jid = env.get("enqueue_kwargs", {}).get("_job_id")
             st_str = "waiting"
-            append_to_event_maps(cd, mes, etapa, st_str, jid)
+            append_to_event_maps(cd, mes, etapa, st_str, jid or "")
             add_job_event(jid, cd, mes, etapa, st_str)
             queue_count += 1
+
+    # 2) Jobs já rodados (logs das runs)
+    tenant = allowed_colab_prefix or ""
+    runs_for_tenant: Dict[str, Any] = {}
+    if tenant:
+        try:
+            runs_for_tenant = await load_runs(rd, tenant)
+        except Exception:
+            runs_for_tenant = {}
+
+    for run in runs_for_tenant.values():
+        cd = cnpj_digits(run.get("cnpj", ""))
+        if not cd:
+            continue
+
+        mes_str = run.get("mes_str") or ""
+        if not mes_str:
+            mes_only = str(run.get("mes") or "").zfill(2)
+            ano_only = str(run.get("ano") or "").strip()
+            mes_str = f"{mes_only}/{ano_only}" if mes_only and ano_only else mes_only
+
+        job_ids = run.get("job_ids") or []
+        for jid in job_ids:
+            try:
+                jlogs = await rd.lrange(task_logs_key(jid), 0, -1)
+            except Exception:
+                jlogs = []
+            if not jlogs:
+                continue
+
+            etapa = detect_etapa_from_logs(jlogs) or ""
+            if not etapa:
+                flags = run.get("etapas") or {}
+                true_steps = [k for k, v in flags.items() if v]
+                if len(true_steps) == 1:
+                    etapa = true_steps[0]
+
+            status = detect_job_status_from_logs(jlogs)
+            if not etapa:
+                add_job_event(jid, cd, mes_str, "", status)
+                continue
+
+            append_to_event_maps(cd, mes_str, etapa, status, jid)
+            add_job_event(jid, cd, mes_str, etapa, status)
+            if status == "running":
+                running_count += 1
 
     def reduce_status(lst: List[Dict[str, Any]]) -> str:
         if not lst:
             return "pending"
-        flags = {e["status"] for e in lst}
-        if "success" in flags and "error" not in flags:
-            return "success"
-        if "running" in flags:
-            return "running"
-        if "queued" in flags or "waiting" in flags:
-            return "waiting"
-        if "error" in flags:
-            return "error"
+        flags = [e["status"] for e in lst]
+        if "running" in flags: return "running"
+        if "success" in flags and "error" not in flags: return "success"
+        if "error" in flags: return "error"
+        if "waiting" in flags or "queued" in flags: return "waiting"
         return "pending"
 
     status_per_cnpj: Dict[str, Dict[str, str]] = {}
@@ -2148,23 +2490,12 @@ async def build_status_index(
         s = {etapa: reduce_status(events[key].get(etapa, [])) for etapa in etapas}
         status_per_cnpj[key] = s
 
-    return {
-        "status_per_cnpj": status_per_cnpj,
-        "job_events": job_events,
-        "kpis": {
-            "running": running_count,
-            "queue": queue_count,
-            "total_cnpjs": len(keys),
-        },
-    }
-
+    return {"status_per_cnpj": status_per_cnpj, "job_events": job_events, "kpis": {"running": running_count, "queue": queue_count, "total_cnpjs": len(keys)}}
 
 @app.get("/api/status")
 async def api_status(request: Request):
-    rd = rds()
-    sess = getattr(request.state, "session", None) or await get_session_from_request(
-        request
-    )
+    rd = app.state.redis_cmd
+    sess = getattr(request.state, "session", None) or await get_session_from_request(request)
     if not sess:
         raise HTTPException(401, "Não autenticado")
     tenant = sess.get("colaborador_norm", "")
@@ -2182,8 +2513,7 @@ async def api_status(request: Request):
     job_events: Dict[str, Dict[str, Any]] = idx.get("job_events", {})
 
     def reduce_status_list(statuses: List[str]) -> str:
-        if not statuses:
-            return "pending"
+        if not statuses: return "pending"
         cur = "pending"
         for st in statuses:
             cur = merge_status(cur, st)
@@ -2192,23 +2522,14 @@ async def api_status(request: Request):
     rows: List[Dict[str, Any]] = []
     for run_id, run in runs.items():
         cd = cnpj_digits(run.get("cnpj", ""))
-        if not cd:
-            continue
+        if not cd: continue
         job_ids: List[str] = run.get("job_ids") or []
-        etapas_status = {
-            "escrituracao": "pending",
-            "notas": "pending",
-            "dam": "pending",
-            "certidao": "pending",
-        }
-        etapa_to_statuses: Dict[str, List[str]] = {
-            k: [] for k in etapas_status.keys()
-        }
+        etapas_status = {"escrituracao":"pending","notas":"pending","dam":"pending","certidao":"pending"}
+        etapa_to_statuses: Dict[str, List[str]] = {k: [] for k in etapas_status.keys()}
 
         for jid in job_ids:
             je = job_events.get(jid)
-            if not je:
-                continue
+            if not je: continue
             etapa = (je.get("etapa") or "").lower()
             st = je.get("status") or "pending"
             if etapa in etapa_to_statuses:
@@ -2218,57 +2539,37 @@ async def api_status(request: Request):
             etapas_status[e] = reduce_status_list(etapa_to_statuses[e])
         geral_status = reduce_status_list(list(etapas_status.values()))
 
-        rows.append(
-            {
-                "run_id": run_id,
-                "cnpj_digits": cd,
-                "cnpj_mask": mask_cnpj(cd),
-                "razao": "",
-                "conta": "",
-                "mes": run.get("mes") or "",
-                "ano": run.get("ano") or "",
-                "etapas": etapas_status,
-                "status_geral": geral_status,
-            }
-        )
+        rows.append({"run_id": run_id,"cnpj_digits": cd,"cnpj_mask": mask_cnpj(cd),"razao": "","conta": "","mes": run.get("mes") or "","ano": run.get("ano") or "","etapas": etapas_status,"status_geral": geral_status})
     rows.sort(key=lambda r: (r["cnpj_digits"], r["ano"], r["mes"], r["run_id"]))
     return {"rows": rows, "kpis": kpis, "arq_enabled": ARQ_ENABLED}
 
-
 @app.get("/api/logs/{cnpj}")
 async def api_logs_for_cnpj(request: Request, cnpj: str):
-    rd = rds()
-
-    sess = getattr(request.state, "session", None) or await get_session_from_request(
-        request
-    )
+    rd = app.state.redis_cmd
+    sess = getattr(request.state, "session", None) or await get_session_from_request(request)
     if not sess:
         raise HTTPException(401, "Não autenticado")
     tenant = sess.get("colaborador_norm", "")
     colab_prefix = tenant + "::" if tenant else ""
 
-    cn = cnpj_digits(cnpj.strip().replace(".", "").replace("/", "").replace("-", ""))
+    cn = cnpj_digits(cnpj.strip().replace(".","").replace("/","").replace("-",""))
     mes = (request.query_params.get("mes") or "").zfill(2)
     ano = (request.query_params.get("ano") or "").strip()
     mes_key = f"{mes}/{ano}" if mes and ano else (mes if mes else "")
     key = f"{cn}:{mes_key}" if mes_key else cn
     rel_cnpjs = {key: {"cnpj": cn, "mes": mes_key}}
     idx = await build_status_index(rel_cnpjs, allowed_colab_prefix=tenant)
-    etapas_status = idx["status_per_cnpj"].get(key) or idx["status_per_cnpj"].get(
-        cn, {}
-    )
+    etapas_status = idx["status_per_cnpj"].get(key) or idx["status_per_cnpj"].get(cn, {})
 
     logs_lines: List[str] = []
     job_ids_for_cnpj = set()
 
-    # Adiciona jobs a partir dos RUNS (execuções deste usuário)
     runs = await load_runs(rd, tenant)
     for r in runs.values():
         if cnpj_digits(r.get("cnpj", "")) == cn:
             for jid in (r.get("job_ids") or []):
                 job_ids_for_cnpj.add(jid)
 
-    # Pré-fila Y
     try:
         colabs = await rd.smembers(PREQUEUE_COLABS_SET)
     except Exception:
@@ -2295,7 +2596,6 @@ async def api_logs_for_cnpj(request: Request, cnpj: str):
                 if jid:
                     job_ids_for_cnpj.add(jid)
 
-    # Carrega logs detalhados
     for jid in sorted(job_ids_for_cnpj):
         try:
             jlogs = await rd.lrange(task_logs_key(jid), 0, -1)
@@ -2305,39 +2605,19 @@ async def api_logs_for_cnpj(request: Request, cnpj: str):
             logs_lines.append(f"=== Job {jid} ===")
             logs_lines.extend(jlogs)
 
-    return {
-        "cnpj": cn,
-        "cnpj_mask": mask_cnpj(cn),
-        "razao": "",
-        "etapas": {
-            "escrituracao": etapas_status.get("escrituracao", "pending"),
-            "notas": etapas_status.get("notas", "pending"),
-            "dam": etapas_status.get("dam", "pending"),
-            "certidao": etapas_status.get("certidao", "pending"),
-        },
-        "logs": "\n".join(logs_lines),
-        "arq_enabled": ARQ_ENABLED,
-    }
-
+    return {"cnpj": cn,"cnpj_mask": mask_cnpj(cn),"razao": "","etapas": {"escrituracao": etapas_status.get("escrituracao", "pending"),"notas": etapas_status.get("notas", "pending"),"dam": etapas_status.get("dam", "pending"),"certidao": etapas_status.get("certidao", "pending")},"logs": "\n".join(logs_lines),"arq_enabled": ARQ_ENABLED}
 
 @app.get("/api/logs_job/{job_id}")
 async def api_logs_for_job(request: Request, job_id: str):
-    rd = rds()
-
-    sess = getattr(request.state, "session", None) or await get_session_from_request(
-        request
-    )
+    rd = app.state.redis_cmd
+    sess = getattr(request.state, "session", None) or await get_session_from_request(request)
     if not sess:
         raise HTTPException(401, "Não autenticado")
     tenant = sess.get("colaborador_norm", "")
     colab_prefix = tenant + "::" if tenant else ""
 
-    cn = ""
-    etapa = ""
-    status = "pending"
-    mes = ""
+    cn = ""; etapa = ""; status = "pending"; mes = ""
 
-    # 1) Tenta achar na PRÉ-FILA Y
     try:
         colabs = await rd.smembers(PREQUEUE_COLABS_SET)
     except Exception:
@@ -2365,16 +2645,10 @@ async def api_logs_for_job(request: Request, job_id: str):
             colab_norm = meta.get("colaborador_norm") or ""
             if colab_prefix and not colab_norm.startswith(colab_prefix):
                 continue
-            cn = cnpj_digits(meta["cnpj"])
-            etapa = meta.get("etapa") or func
-            mes = meta.get("mes") or ""
-            status = "waiting"
-            found = True
-            break
-        if found:
-            break
+            cn = cnpj_digits(meta["cnpj"]); etapa = meta.get("etapa") or func; mes = meta.get("mes") or ""
+            status = "waiting"; found = True; break
+        if found: break
 
-    # 2) Se ainda não achou, tenta localizar via RUNS (apenas cnpj/mes)
     if not cn:
         runs = await load_runs(rd, tenant)
         for r in runs.values():
@@ -2384,17 +2658,12 @@ async def api_logs_for_job(request: Request, job_id: str):
                 if not mes:
                     mes_only = (r.get("mes") or "").zfill(2)
                     ano_only = str(r.get("ano") or "").strip()
-                    mes = (
-                        f"{mes_only}/{ano_only}"
-                        if mes_only and ano_only
-                        else (mes_only or "")
-                    )
+                    mes = f"{mes_only}/{ano_only}" if mes_only and ano_only else (mes_only or "")
                 break
 
     if not cn:
         raise HTTPException(404, "Job não encontrado para este usuário.")
 
-    # 3) Carrega logs do job e tenta inferir status final
     try:
         jlogs = await rd.lrange(task_logs_key(job_id), 0, -1)
     except Exception:
@@ -2402,46 +2671,21 @@ async def api_logs_for_job(request: Request, job_id: str):
     logs = "\n".join(jlogs or [])
 
     if jlogs:
-        lower = "\n".join(jlogs).lower()
-        if any(w in lower for w in ["erro", "error", "exception", "traceback", "failed"]):
-            status = "error"
-        elif status != "waiting":
-            # se não está waiting na pré-fila e tem logs, consideramos "success" por simplicidade
-            status = "success"
+        status = detect_job_status_from_logs(jlogs)
 
     etapas_status: Dict[str, str] = {}
     if cn:
         key = f"{cn}:{mes}" if mes else cn
         rel_cnpjs = {key: {"cnpj": cn, "mes": mes}}
         idx = await build_status_index(rel_cnpjs, allowed_colab_prefix=tenant)
-        etapas_status = idx["status_per_cnpj"].get(key) or idx["status_per_cnpj"].get(
-            cn, {}
-        )
+        etapas_status = idx["status_per_cnpj"].get(key) or idx["status_per_cnpj"].get(cn, {})
 
-    return {
-        "job_id": job_id,
-        "cnpj": cn,
-        "cnpj_mask": mask_cnpj(cn) if cn else "",
-        "razao": "",
-        "etapa": etapa,
-        "status": status,
-        "etapas": {
-            "escrituracao": etapas_status.get("escrituracao", "pending"),
-            "notas": etapas_status.get("notas", "pending"),
-            "dam": etapas_status.get("dam", "pending"),
-            "certidao": etapas_status.get("certidao", "pending"),
-        },
-        "logs": logs,
-        "arq_enabled": ARQ_ENABLED,
-    }
-
+    return {"job_id": job_id,"cnpj": cn,"cnpj_mask": mask_cnpj(cn) if cn else "","razao": "","etapa": etapa,"status": status,"etapas": {"escrituracao": etapas_status.get("escrituracao", "pending"),"notas": etapas_status.get("notas", "pending"),"dam": etapas_status.get("dam", "pending"),"certidao": etapas_status.get("certidao", "pending")},"logs": logs,"arq_enabled": ARQ_ENABLED}
 
 @app.get("/api/logs_run/{run_id}")
 async def api_logs_for_run(request: Request, run_id: str):
-    rd = rds()
-    sess = getattr(request.state, "session", None) or await get_session_from_request(
-        request
-    )
+    rd = app.state.redis_cmd
+    sess = getattr(request.state, "session", None) or await get_session_from_request(request)
     if not sess:
         raise HTTPException(401, "Não autenticado")
     tenant = sess.get("colaborador_norm", "")
@@ -2452,81 +2696,31 @@ async def api_logs_for_run(request: Request, run_id: str):
         raise HTTPException(404, "Execução não encontrada.")
 
     cn = cnpj_digits(run.get("cnpj", ""))
-
-    # Para o índice de etapas, usamos apenas PRÉ-FILA
-    rel_cnpjs = {cn: {"cnpj": cn}}
-    idx = await build_status_index(rel_cnpjs, allowed_colab_prefix=tenant)
-    job_events = idx.get("job_events", {})
-
     job_ids: List[str] = run.get("job_ids") or []
-    etapa_to_statuses: Dict[str, List[str]] = {
-        "escrituracao": [],
-        "notas": [],
-        "dam": [],
-        "certidao": [],
-    }
-    for jid in job_ids:
-        je = job_events.get(jid)
-        if not je:
-            continue
-        etapa = (je.get("etapa") or "").lower()
-        st = je.get("status") or "pending"
-        if etapa in etapa_to_statuses:
-            etapa_to_statuses[etapa].append(st)
 
-    def reduce_status_list(statuses: List[str]) -> str:
-        if not statuses:
-            return "pending"
-        cur = "pending"
-        for st in statuses:
-            cur = merge_status(cur, st)
-        return cur
-
-    etapas_status_run: Dict[str, str] = {
-        e: reduce_status_list(etapa_to_statuses[e]) for e in etapa_to_statuses
-    }
-
+    etapas_status_run: Dict[str, str] = {"escrituracao":"pending","notas":"pending","dam":"pending","certidao":"pending"}
     logs_lines: List[str] = []
+
     for jid in job_ids:
         try:
             jlogs = await rd.lrange(task_logs_key(jid), 0, -1)
         except Exception:
             jlogs = []
-        if jlogs:
-            logs_lines.append(f"=== Job {jid} ===")
-            logs_lines.extend(jlogs)
+        if not jlogs:
+            continue
+        logs_lines.append(f"=== Job {jid} ==="); logs_lines.extend(jlogs)
+        etapa_detectada = detect_etapa_from_logs(jlogs)
+        job_status = detect_job_status_from_logs(jlogs)
+        if etapa_detectada:
+            cur = etapas_status_run.get(etapa_detectada, "pending")
+            etapas_status_run[etapa_detectada] = merge_status(cur, job_status)
 
-    return {
-        "run_id": run_id,
-        "cnpj": cn,
-        "cnpj_mask": mask_cnpj(cn),
-        "razao": "",
-        "mes": run.get("mes") or "",
-        "ano": run.get("ano") or "",
-        "etapas": {
-            "escrituracao": etapas_status_run.get("escrituracao", "pending"),
-            "notas": etapas_status_run.get("notas", "pending"),
-            "dam": etapas_status_run.get("dam", "pending"),
-            "certidao": etapas_status_run.get("certidao", "pending"),
-        },
-        "logs": "\n".join(logs_lines),
-        "arq_enabled": ARQ_ENABLED,
-    }
-
+    return {"run_id": run_id,"cnpj": cn,"cnpj_mask": mask_cnpj(cn),"razao": "","mes": run.get("mes") or "","ano": run.get("ano") or "","etapas": etapas_status_run,"logs": "\n".join(logs_lines),"arq_enabled": ARQ_ENABLED}
 
 @app.post("/api/stop_all")
 async def api_stop_all(request: Request):
-    """
-    Stop All agora só limpa a PRÉ-FILA Y do tenant.
-
-    (Sem ARQ, não tem mais "abort" de jobs numa fila externa;
-     quem consumir a fila deve respeitar isso se necessário.)
-    """
-    rd = rds()
-
-    sess = getattr(request.state, "session", None) or await get_session_from_request(
-        request
-    )
+    rd = app.state.redis_cmd
+    sess = getattr(request.state, "session", None) or await get_session_from_request(request)
     if not sess:
         raise HTTPException(401, "Não autenticado")
     tenant = sess.get("colaborador_norm", "")
@@ -2543,15 +2737,8 @@ async def api_stop_all(request: Request):
         pass
     for r in runs.values():
         colab_norm = r.get("colaborador_norm")
-        if colab_norm and (
-            not tenant_prefix or str(colab_norm).startswith(tenant_prefix)
-        ):
+        if colab_norm and (not tenant_prefix or str(colab_norm).startswith(tenant_prefix)):
             colabs.add(str(colab_norm))
-
-    job_ids_to_abort = set()
-    for r in runs.values():
-        for jid in (r.get("job_ids") or []):
-            job_ids_to_abort.add(jid)
 
     prequeue_removed = 0
 
@@ -2569,96 +2756,30 @@ async def api_stop_all(request: Request):
         except Exception:
             pass
 
-    # Sem ARQ, não há abort "real", então retornamos apenas info da pré-fila.
-    return {
-        "status": "ok",
-        "stopped_jobs": 0,
-        "prequeue_removed": prequeue_removed,
-        "ids": [],
-        "arq_enabled": ARQ_ENABLED,
-    }
+    dbg(f"[stop_all] tenant={tenant} prequeue_removed={prequeue_removed}")
+    return {"status": "ok","stopped_jobs": 0,"prequeue_removed": prequeue_removed,"ids": [],"arq_enabled": ARQ_ENABLED}
 
-
-# ===================== IMPORTAÇÃO XLSX (parse) =====================
-
-
-@app.post("/api/import_cnpjs")
-async def api_import_cnpjs(
-    account_id: str = Form(...), file: UploadFile = File(...)
-):
-    try:
-        import openpyxl  # type: ignore
-    except ImportError:
-        raise HTTPException(
-            500,
-            "Biblioteca openpyxl não instalada. Instale com: pip install openpyxl",
-        )
-    data = await file.read()
-    from io import BytesIO
-
-    wb = openpyxl.load_workbook(BytesIO(data), data_only=True)
-    ws = wb.active
-
-    cnpjs_out: List[Dict[str, str]] = []
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if not row or not row[0]:
-            continue
-        cnpj_raw = str(row[0])
-        cd = cnpj_digits(cnpj_raw)
-        razao = (
-            str(row[1]) if len(row) > 1 and row[1] is not None else ""
-        )
-        dominio = (
-            str(row[2]) if len(row) > 2 and row[2] is not None else ""
-        )
-        cnpjs_out.append(
-            {"cnpj": cd, "razao": razao, "dominio": dominio}
-        )
-    return {
-        "status": "ok",
-        "imported": len(cnpjs_out),
-        "cnpjs": cnpjs_out,
-    }
-
-
-# ===================== PCLOUD (igual ao seu) =====================
-
-import requests
+# ===================== PCLOUD (opcional p/ ZIP) =====================
 
 PCLOUD_API = "https://api.pcloud.com"
 PCLOUD_TOKEN = "MuRLgkZbz3P7ZeaIUlazWc9F7GAuXnBCeK4WPre7y"
 PCLOUD_ROOT = "/issbot"
 
-
-def _pcloud_request(
-    method: str, endpoint: str, *, params=None, data=None, files=None
-) -> dict:
+def _pcloud_request(method: str, endpoint: str, *, params=None, data=None, files=None) -> dict:
     url = f"{PCLOUD_API}/{endpoint}"
-    p = dict(params or {})
-    p.setdefault("auth", PCLOUD_TOKEN)
-    r = requests.request(
-        method, url, params=p, data=data, files=files, timeout=60
-    )
+    p = dict(params or {}); p.setdefault("auth", PCLOUD_TOKEN)
+    r = requests.request(method, url, params=p, data=data, files=files, timeout=60)
     r.raise_for_status()
     js = r.json()
     if js.get("result") != 0:
-        raise RuntimeError(
-            js.get("error", f"Erro desconhecido na API pCloud ({endpoint})")
-        )
+        raise RuntimeError(js.get("error", f"Erro desconhecido na API pCloud ({endpoint})"))
     return js
-
 
 def get_zip_url_for_subpath(remote_subpath: str) -> str:
     remote_subpath = (remote_subpath or "").strip("/")
     remote_path = f"{PCLOUD_ROOT}/{remote_subpath}"
-    js_link = _pcloud_request(
-        "get", "getfolderpublink", params={"path": remote_path}
-    )
-    code = (
-        js_link.get("code")
-        or js_link.get("linkid")
-        or (js_link.get("metadata") or {}).get("code")
-    )
+    js_link = _pcloud_request("get", "getfolderpublink", params={"path": remote_path})
+    code = (js_link.get("code") or js_link.get("linkid") or (js_link.get("metadata") or {}).get("code"))
     if not code:
         raise RuntimeError(f"Pasta não encontrada no pCloud: {remote_path}")
     js_zip = _pcloud_request("get", "getpubziplink", params={"code": code})
@@ -2667,42 +2788,242 @@ def get_zip_url_for_subpath(remote_subpath: str) -> str:
         raise RuntimeError("getpubziplink retornou dados inválidos.")
     return f"https://{hosts[0]}{zip_path}"
 
-
 @app.get("/api/download_zip")
 async def api_download_zip(request: Request):
-    sess = getattr(request.state, "session", None) or await get_session_from_request(
-        request
-    )
+    sess = getattr(request.state, "session", None) or await get_session_from_request(request)
     if not sess:
         raise HTTPException(401, "Não autenticado.")
     colaborador_norm = (sess.get("colaborador_norm") or "").strip()
     mes_norm = (sess.get("mes_norm") or "").strip()
     if not colaborador_norm:
-        raise HTTPException(
-            400, "Sessão inválida (colaborador_norm)."
-        )
+        raise HTTPException(400, "Sessão inválida (colaborador_norm).")
     remote_path = colaborador_norm + (f"/{mes_norm}" if mes_norm else "")
     try:
         zip_url = get_zip_url_for_subpath(remote_path)
     except Exception as exc:
-        raise HTTPException(
-            500, f"Erro ao gerar ZIP no pCloud: {exc}"
-        )
+        raise HTTPException(500, f"Erro ao gerar ZIP no pCloud: {exc}")
     return RedirectResponse(zip_url, status_code=302)
 
+# ===================== WEBSOCKET: PUSH runs/status/log =====================
 
-# ==============================================================
-# SCHEDULER INTERNO — PRÉ-FILA Y ➜ ARQ (usando somente WebSocket)
-# ==============================================================
+class LiveHub:
+    def __init__(self):
+        self.tenants_clients: Dict[str, Set[WebSocket]] = {}
+        self.tenants_sub_task: Dict[str, asyncio.Task] = {}
+        self.lock = asyncio.Lock()
 
-import asyncio
-import json
-import pickle
-import time
+    async def attach(self, tenant: str, ws: WebSocket):
+        async with self.lock:
+            self.tenants_clients.setdefault(tenant, set()).add(ws)
+            if tenant not in self.tenants_sub_task:
+                self.tenants_sub_task[tenant] = asyncio.create_task(self._run_subscriber_loop(tenant))
+        dbg("[livehub] attach tenant=", tenant, "clients=", len(self.tenants_clients.get(tenant, set())))
+
+    async def detach(self, tenant: str, ws: WebSocket):
+        async with self.lock:
+            if tenant in self.tenants_clients:
+                self.tenants_clients[tenant].discard(ws)
+        dbg("[livehub] detach tenant=", tenant)
+
+    async def _broadcast(self, tenant: str, payload: Dict[str, Any]):
+        conns = self.tenants_clients.get(tenant, set())
+        for c in list(conns):
+            try:
+                await c.send_json(payload)
+            except Exception as e:
+                conns.discard(c)
+        dbg("[livehub] broadcast", payload.get("type"), "to", len(conns), "client(s)")
+
+    async def _run_subscriber_loop(self, tenant: str):
+        # Cada tenant tem seu próprio pubsub / conexão WS com o Redis
+        pubsub = AsyncRedisPubSubWS(REDIS_WS_URL, token=REDIS_TOKEN)
+        await pubsub.connect()
+
+        runs_channel = f"{REDIS_LOG_NS}:front:{tenant}:runs:updated"
+        await pubsub.subscribe(runs_channel)
+
+        known_job_channels: Set[str] = set()
+        runs: Dict[str, Any] = {}
+
+        # Snapshot inicial
+        try:
+            runs = await load_runs(app.state.redis_cmd, tenant)
+            await self._broadcast(tenant, {"type": "runs", "runs": runs})
+            rows, kpis = await compute_status_for_tenant(tenant, runs)
+            await self._broadcast(tenant, {"type": "status", "rows": rows, "kpis": kpis})
+
+            for r in runs.values():
+                for jid in (r.get("job_ids") or []):
+                    ch = f"{REDIS_LOG_NS}:task:{jid}:logs"
+                    if ch not in known_job_channels:
+                        await pubsub.subscribe(ch)
+                        known_job_channels.add(ch)
+        except Exception as e:
+            print("[livehub] snapshot inicial erro:", repr(e))
+
+        try:
+            while True:
+                try:
+                    msg = await pubsub.read_message()
+                    if not msg:
+                        await asyncio.sleep(0.05)
+                        continue
+
+                    if msg["type"] == "message":
+                        channel = msg["channel"]
+                        payload = msg.get("payload") or ""
+
+                        if channel == runs_channel:
+                            try:
+                                runs = json.loads(payload or "{}")
+                            except Exception:
+                                runs = {}
+                            await self._broadcast(tenant, {"type": "runs", "runs": runs})
+
+                            new_jobs: Set[str] = set()
+                            for r in runs.values():
+                                for jid in (r.get("job_ids") or []):
+                                    new_jobs.add(jid)
+                            for jid in new_jobs:
+                                ch = f"{REDIS_LOG_NS}:task:{jid}:logs"
+                                if ch not in known_job_channels:
+                                    await pubsub.subscribe(ch)
+                                    known_job_channels.add(ch)
+
+                            asyncio.create_task(self._push_status_async(tenant, runs))
+
+                        elif channel.startswith(f"{REDIS_LOG_NS}:task:") and channel.endswith(":logs"):
+                            try:
+                                jid = channel.split(":task:")[1].rsplit(":", 1)[0]
+                            except Exception:
+                                jid = ""
+                            await self._broadcast(
+                                tenant,
+                                {
+                                    "type": "log",
+                                    "job_id": jid,
+                                    "line": payload,
+                                    "channel": channel,
+                                },
+                            )
+                            asyncio.create_task(self._push_status_async(tenant, runs))
+                except Exception as e:
+                    print("[livehub] loop erro:", repr(e))
+                    await asyncio.sleep(0.25)
+        finally:
+            await pubsub.aclose()
+
+
+    async def _push_status_async(self, tenant: str, runs: Dict[str, Any]):
+        try:
+            rows, kpis = await compute_status_for_tenant(tenant, runs)
+            await self._broadcast(tenant, {"type": "status", "rows": rows, "kpis": kpis})
+        except Exception as e:
+            print("[livehub] _push_status_async erro:", repr(e))
+
+livehub = LiveHub()
+
+async def compute_status_for_tenant(tenant: str, runs: Dict[str, Any]):
+    rel_cnpjs: Dict[str, Dict[str, Any]] = {}
+    for run in runs.values():
+        cd = cnpj_digits(run.get("cnpj", ""))
+        if not cd: continue
+        mes_str = run.get("mes_str") or ""
+        key = f"{cd}:{mes_str}" if mes_str else cd
+        rel_cnpjs[key] = {"cnpj": cd, "mes": mes_str}
+
+    idx = await build_status_index(rel_cnpjs, allowed_colab_prefix=tenant)
+    kpis = idx["kpis"]; job_events: Dict[str, Dict[str, Any]] = idx.get("job_events", {})
+
+    def reduce_status_list(statuses: List[str]) -> str:
+        if not statuses: return "pending"
+        cur = "pending"
+        for st in statuses:
+            cur = merge_status(cur, st)
+        return cur
+
+    rows: List[Dict[str, Any]] = []
+    for run_id, run in runs.items():
+        cd = cnpj_digits(run.get("cnpj", ""))
+        if not cd: continue
+        job_ids: List[str] = run.get("job_ids") or []
+        etapas_status = {"escrituracao":"pending","notas":"pending","dam":"pending","certidao":"pending"}
+        etapa_to_statuses: Dict[str, List[str]] = {k: [] for k in etapas_status.keys()}
+
+        for jid in job_ids:
+            je = job_events.get(jid)
+            if not je: continue
+            etapa = (je.get("etapa") or "").lower()
+            st = je.get("status") or "pending"
+            if etapa in etapa_to_statuses:
+                etapa_to_statuses[etapa].append(st)
+
+        for e in etapa_to_statuses:
+            etapas_status[e] = reduce_status_list(etapa_to_statuses[e])
+        geral_status = reduce_status_list(list(etapas_status.values()))
+
+        rows.append({"run_id": run_id,"cnpj_digits": cd,"cnpj_mask": mask_cnpj(cd),"razao": "","conta": "","mes": run.get("mes") or "","ano": run.get("ano") or "","etapas": etapas_status,"status_geral": geral_status})
+    rows.sort(key=lambda r: (r["cnpj_digits"], r["ano"], r["mes"], r["run_id"]))
+
+    last_raw = await app.state.redis_cmd.get(FRONT_LAST_RUN_KEY)
+    last_str = "—"
+    if last_raw:
+        try:
+            ts = float(last_raw)
+            last_str = time.strftime("%d/%m %H:%M", time.localtime(ts))
+        except Exception:
+            pass
+    kpis["last_run_str"] = last_str
+    kpis["arq_enabled"] = ARQ_ENABLED
+
+    return rows, kpis
+
+@app.websocket("/ws")
+async def ws_bridge(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        cookie_header = websocket.headers.get("cookie", "") or websocket.headers.get("Cookie", "")
+        token = ""
+        for part in cookie_header.split(";"):
+            part = part.strip()
+            if not part: continue
+            if part.startswith(SESSION_COOKIE_NAME + "="):
+                token = part.split("=", 1)[1]; break
+
+        if not token:
+            await websocket.send_json({"type": "error", "detail": "Não autenticado"}); await websocket.close(); return
+
+        rd = app.state.redis_cmd
+        raw = await rd.get(session_key(token))
+        if not raw:
+            await websocket.send_json({"type": "error", "detail": "Sessão inválida"}); await websocket.close(); return
+
+        sess = json.loads(raw)
+        tenant = sess.get("colaborador_norm") or ""
+        if not tenant:
+            await websocket.send_json({"type": "error", "detail": "Sessão sem tenant"}); await websocket.close(); return
+    except Exception as e:
+        await websocket.send_json({"type": "error", "detail": f"Falha de sessão: {e!s}"}); await websocket.close(); return
+
+    await websocket.send_json({"type": "hello", "tenant": tenant})
+    await livehub.attach(tenant, websocket)
+
+    try:
+        while True:
+            try:
+                _ = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+            except asyncio.TimeoutError:
+                await websocket.send_json({"type": "ping", "ts": time.time()})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await livehub.detach(tenant, websocket)
+
+# ===================== SCHEDULER INTERNO — Y ➜ ARQ =====================
 
 async def scheduler_y_to_arq():
     print("[scheduler] iniciado!")
-    rd = app.state.redis
+    rd: AsyncRedisWS = app.state.redis_scheduler
 
     while True:
         try:
@@ -2722,48 +3043,24 @@ async def scheduler_y_to_arq():
                 func = env.get("func")
                 args_list = env.get("args") or []
                 job_id = env.get("enqueue_kwargs", {}).get("_job_id")
-
                 if not job_id:
                     continue
 
-                # ===== FORMATO EXATO DE UM JOBDEF =====
-
                 now_ms = int(time.time() * 1000)
 
-                jobdef = {
-                    "t": 1,                      # job_try
-                    "f": func,                  # nome da função
-                    "a": tuple(args_list),      # args = tuple
-                    "k": {},                    # kwargs (vazio)
-                    "et": now_ms,               # enqueue_time_ms
-                }
+                jobdef = {"t": 1,"f": func,"a": tuple(args_list),"k": {},"et": now_ms}
 
-                # Gravar jobdef do jeito correto
                 await rd.set(f"arq:job:{job_id}", pickle.dumps(jobdef))
-
-                # Colocar job no ZSET da fila
                 await rd.zadd("arq:queue", now_ms, job_id)
 
                 print(f"[scheduler] job {job_id} → ARQ OK")
-
         except Exception as e:
             print("[scheduler] erro:", repr(e))
 
         await asyncio.sleep(0.25)
 
-
-
-
-
-
 # ===================== MAIN =====================
 
 if __name__ == "__main__":
     import uvicorn
-
-    uvicorn.run(
-        "queue_client_front:app",
-        host="0.0.0.0",
-        port=8001,
-        reload=True,
-    )
+    uvicorn.run("queue_client_front:app", host="0.0.0.0", port=8001, reload=True)
