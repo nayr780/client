@@ -2227,43 +2227,53 @@ async def api_me(request: Request):
         raise HTTPException(401, "Não autenticado")
     return {"colaborador": sess.get("colaborador", ""), "colaborador_norm": sess.get("colaborador_norm", "")}
 
-# --------- NOVO: import XLSX (para evitar 404) ---------
+import unicodedata
+
+def normalize(s: str) -> str:
+    s = s.strip().lower()
+    s = ''.join(c for c in unicodedata.normalize('NFKD', s) if not unicodedata.combining(c))
+    s = s.replace("_", " ").replace("-", " ")
+    while "  " in s:
+        s = s.replace("  ", " ")
+    return s
+
 @app.post("/api/import_cnpjs")
 async def api_import_cnpjs(account_id: str = Form(...), file: UploadFile = File(...)):
-    """
-    Espera colunas: CNPJ, Razão Social, Código Domínio
-    """
     dbg("[import] recebendo arquivo:", file.filename, "para account:", account_id)
-    try:
-        from openpyxl import load_workbook
-    except Exception as e:
-        dbg("[import] openpyxl ausente:", repr(e))
-        raise HTTPException(500, "Dependência 'openpyxl' não instalada no servidor.")
 
-    try:
-        content = await file.read()
-        from io import BytesIO
-        wb = load_workbook(BytesIO(content), read_only=True, data_only=True)
-        ws = wb.active
-        headers = []
-        rows_out = []
+    from openpyxl import load_workbook
 
-        for i, row in enumerate(ws.iter_rows(values_only=True), start=1):
-            if i == 1:
-                headers = [str(x or "").strip().lower() for x in row]
-                continue
-            record = {headers[j]: (row[j] if j < len(row) else "") for j in range(len(headers))}
-            cnpj = str(record.get("cnpj") or record.get("cnpjs") or "").strip()
-            razao = str(record.get("razão social") or record.get("razao social") or record.get("razao") or "").strip()
-            dominio = str(record.get("código domínio") or record.get("codigo dominio") or record.get("dominio") or "").strip()
-            if not cnpj:
-                continue
-            rows_out.append({"cnpj": cnpj, "razao": razao, "dominio": dominio})
-        dbg(f"[import] linhas extraídas: {len(rows_out)}")
-        return {"cnpjs": rows_out}
-    except Exception as e:
-        dbg("[import] erro:", repr(e))
-        raise HTTPException(500, f"Falha ao ler XLSX: {e}")
+    content = await file.read()
+    from io import BytesIO
+    wb = load_workbook(BytesIO(content), read_only=True, data_only=True)
+    ws = wb.active
+
+    rows_out = []
+    headers = []
+
+    for i, row in enumerate(ws.iter_rows(values_only=True), start=1):
+        if i == 1:
+            headers = [normalize(str(x or "")) for x in row]
+            continue
+
+        rec = {headers[j]: (row[j] if j < len(row) else "") for j in range(len(headers))}
+
+        cnpj    = str(rec.get("cnpj", "")).strip()
+        razao   = str(rec.get("razao social", "")).strip()
+        dominio = str(rec.get("codigo dominio", "")).strip()
+
+        if not cnpj:
+            continue
+
+        rows_out.append({
+            "cnpj": cnpj,
+            "razao": razao,
+            "dominio": dominio
+        })
+
+    dbg(f"[import] linhas extraídas: {len(rows_out)}")
+    return {"cnpjs": rows_out}
+
 
 @app.post("/api/enqueue")
 async def api_enqueue(request: Request, payload: Dict[str, Any]):
@@ -2797,104 +2807,135 @@ async def api_stop_all(request: Request):
 
 # ================= PCLOUD (ZIP PÚBLICO 100% FUNCIONAL) =================
 
+import os
+import requests
+from typing import Iterator, Optional
+from fastapi import HTTPException
+from fastapi.responses import StreamingResponse
 
-PCLOUD_API   = "https://api.pcloud.com"
-PCLOUD_TOKEN = "MuRLgkZbz3P7ZeaIUlazWc9F7GAuXnBCeK4WPre7y"
-PCLOUD_ROOT  = "/issbot"
+# ===================== PCLOUD (opcional p/ ZIP) =====================
 
-def _pcloud_request(endpoint: str, *, params=None) -> dict:
-    """
-    Chama a API pCloud e retorna o JSON.
-    Lança RuntimeError se 'result' != 0.
-    """
+PCLOUD_API = "https://api.pcloud.com"
+# use variável de ambiente em vez de token hard-coded
+PCLOUD_TOKEN = os.getenv("PCLOUD_TOKEN", "REPLACE_ME_IN_ENV")
+PCLOUD_ROOT = "/issbot"
+# tamanho do chunk ao fazer proxy do conteúdo
+PCLOUD_STREAM_CHUNK = 8192
+PCLOUD_REQUEST_TIMEOUT = (10, 120)  # (connect, read) seconds
+
+def _pcloud_request(method: str, endpoint: str, *, params=None, data=None, files=None) -> dict:
     url = f"{PCLOUD_API}/{endpoint}"
     p = dict(params or {})
     p.setdefault("auth", PCLOUD_TOKEN)
-
-    resp = requests.get(url, params=p, timeout=30)
-    resp.raise_for_status()
-    js = resp.json()
-    if js.get("result") not in (0, True):
-        # Algumas rotas usam 'result': True
-        raise RuntimeError(js.get("error", f"Erro desconhecido em {endpoint}"))
-    return js
-
-def ensure_folder_published(folderid: int) -> str:
-    """
-    Garante que a pasta já tenha um link público.
-    Tenta getfolderpublink → se 404, chama setpublink → então getfolderpublink de novo.
-    Retorna o 'code'.
-    """
     try:
-        js = _pcloud_request("getfolderpublink", params={"folderid": folderid})
-        # resposta: { "result":0, "metadata":{...}, "code":"XYZ", ... }
-        return js["code"]
-    except requests.HTTPError as e:
-        # se deu 404, vamos publicar
-        if e.response.status_code == 404:
-            # cria novo
-            js2 = _pcloud_request("setpublink", params={"folderid": folderid})
-            code = js2.get("code")
-            if not code:
-                raise RuntimeError("Falha ao setpublink(publishfolder)")
-            # então recupera
-            js3 = _pcloud_request("getfolderpublink", params={"folderid": folderid})
-            return js3["code"]
-        raise
+        r = requests.request(method, url, params=p, data=data, files=files, timeout=60)
+        r.raise_for_status()
+    except requests.HTTPError as he:
+        # re-raise com descrição para debugging / logs
+        raise RuntimeError(f"{he} - {r.status_code if 'r' in locals() and r is not None else ''}")
+    except Exception as e:
+        raise RuntimeError(f"Erro na requisição pCloud ({endpoint}): {e}")
+    try:
+        js = r.json()
+    except ValueError:
+        raise RuntimeError(f"Resposta inválida do pCloud para {endpoint}")
+    if js.get("result") is not None and js.get("result") != 0:
+        # API pCloud normalmente usa campo 'result' para indicar sucesso (0)
+        raise RuntimeError(js.get("error", f"Erro na API pCloud ({endpoint})"))
+    return js
 
 def get_zip_url_for_subpath(remote_subpath: str) -> str:
     """
-    Gera um URL para download do ZIP público.
+    Retorna a URL pública (temporária) do ZIP para a pasta remota no pCloud.
     """
     remote_subpath = (remote_subpath or "").strip("/")
     remote_path = f"{PCLOUD_ROOT}/{remote_subpath}"
-
-    # 1) Stat para obter folderid
-    js_stat = _pcloud_request("stat", params={"path": remote_path})
-    md = js_stat.get("metadata") or {}
-    folderid = md.get("folderid")
-    if not folderid:
-        raise RuntimeError(f"Pasta não existe em pCloud: {remote_path}")
-
-    # 2) Garante link público e obtém o código
-    code = ensure_folder_published(folderid)
-
-    # 3) Gera o ZIP público
-    js_zip = _pcloud_request("getpubziplink", params={"code": code})
-    hosts    = js_zip.get("hosts")
-    zip_path = js_zip.get("path")
+    # 1) tenta obter o public link / code da pasta
+    js_link = _pcloud_request("get", "getfolderpublink", params={"path": remote_path})
+    # o campo pode se chamar 'code' ou 'linkid' dependendo da resposta
+    code = (js_link.get("code") or js_link.get("linkid") or (js_link.get("metadata") or {}).get("code"))
+    if not code:
+        raise RuntimeError(f"Pasta não encontrada no pCloud: {remote_path}")
+    # 2) solicita o link do ZIP público (retorna hosts + path)
+    js_zip = _pcloud_request("get", "getpubziplink", params={"code": code})
+    hosts, zip_path = js_zip.get("hosts"), js_zip.get("path")
     if not hosts or not zip_path:
-        raise RuntimeError("Resposta inválida de getpubziplink")
-
+        raise RuntimeError("getpubziplink retornou dados inválidos.")
+    # monta URL final
     return f"https://{hosts[0]}{zip_path}"
 
-# ================= FASTAPI ENDPOINT =================
+def _iter_stream_response(resp: requests.Response, chunk_size: int = PCLOUD_STREAM_CHUNK) -> Iterator[bytes]:
+    try:
+        for chunk in resp.iter_content(chunk_size=chunk_size):
+            if chunk:
+                yield chunk
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+
+def stream_zip_from_pcloud(remote_subpath: str, filename: Optional[str] = None) -> StreamingResponse:
+    """
+    Gera um StreamingResponse que proxy-a o ZIP vindo do pCloud para o cliente.
+    """
+    zip_url = get_zip_url_for_subpath(remote_subpath)
+    try:
+        # Faz GET direto no zip_url (servidor fará a requisição, mesmo IP que gerou o link)
+        resp = requests.get(zip_url, stream=True, timeout=PCLOUD_REQUEST_TIMEOUT)
+        resp.raise_for_status()
+    except requests.HTTPError as he:
+        # repassa erro mais legível
+        status = getattr(he.response, "status_code", None) if isinstance(he, requests.HTTPError) else None
+        raise HTTPException(502, f"Erro ao baixar ZIP do pCloud (status={status}): {he}")
+    except Exception as e:
+        raise HTTPException(502, f"Erro ao acessar URL do pCloud: {e}")
+
+    # tenta extrair filename do header Content-Disposition do pCloud, se não houver, monta um padrão
+    if not filename:
+        cd = resp.headers.get("content-disposition", "")
+        fname = None
+        if "filename=" in cd:
+            # exemplo: attachment; filename="meuarquivo.zip"
+            try:
+                fname = cd.split("filename=")[1].strip().strip('"').split(";")[0]
+            except Exception:
+                fname = None
+        if not fname:
+            # fallback: transforma remote_subpath em nome seguro
+            sanitized = (remote_subpath or "download").strip("/").replace("/", "_") or "download"
+            fname = f"{sanitized}.zip"
+        filename = fname
+
+    headers = {}
+    # repassa content-length se pCloud informou (opcional)
+    if resp.headers.get("content-length"):
+        headers["Content-Length"] = resp.headers.get("content-length")
+    headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    # content-type: application/zip
+    return StreamingResponse(_iter_stream_response(resp), media_type="application/zip", headers=headers)
+
+# ===================== Endpoint atualizado (FastAPI) =====================
 
 @app.get("/api/download_zip")
 async def api_download_zip(request: Request):
-    # 1) Autenticação
     sess = getattr(request.state, "session", None) or await get_session_from_request(request)
     if not sess:
         raise HTTPException(401, "Não autenticado.")
-
     colaborador_norm = (sess.get("colaborador_norm") or "").strip()
-    mes_norm         = (sess.get("mes_norm") or "").strip()
-
+    mes_norm = (sess.get("mes_norm") or "").strip()
     if not colaborador_norm:
-        raise HTTPException(400, "Sessão inválida (colaborador_norm ausente).")
-
-    # 2) Monta caminho no pCloud
+        raise HTTPException(400, "Sessão inválida (colaborador_norm).")
     remote_path = colaborador_norm + (f"/{mes_norm}" if mes_norm else "")
 
-    # 3) Tenta gerar URL
     try:
-        zip_url = get_zip_url_for_subpath(remote_path)
+        # ao invés de redirecionar, fazemos proxy/stream do ZIP
+        return stream_zip_from_pcloud(remote_path)
+    except HTTPException:
+        raise
     except Exception as exc:
-        raise HTTPException(500, f"Erro ao gerar ZIP no pCloud: {exc}")
-
-    # 4) Redireciona para o ZIP
-    return RedirectResponse(zip_url, status_code=302)
-
+        # logue exc em seu logger real
+        raise HTTPException(500, f"Erro ao gerar/streamar ZIP no pCloud: {exc}")
 
 
 # ===================== WEBSOCKET: PUSH runs/status/log =====================
@@ -3157,4 +3198,3 @@ async def scheduler_y_to_arq():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("queue_client_front:app", host="0.0.0.0", port=8001, reload=True)
-
