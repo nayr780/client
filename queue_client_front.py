@@ -2817,7 +2817,7 @@ from fastapi.responses import StreamingResponse
 
 PCLOUD_API = "https://api.pcloud.com"
 # use variável de ambiente em vez de token hard-coded
-PCLOUD_TOKEN = os.getenv("PCLOUD_TOKEN", "REPLACE_ME_IN_ENV")
+PCLOUD_TOKEN = "MuRLgkZbz3P7ZeaIUlazWc9F7GAuXnBCeK4WPre7y"
 PCLOUD_ROOT = "/issbot"
 # tamanho do chunk ao fazer proxy do conteúdo
 PCLOUD_STREAM_CHUNK = 8192
