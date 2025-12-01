@@ -1,42 +1,49 @@
 #!/usr/bin/env python3
-# queue_client_front.py — Versão cliente do painel ISS
+# queue_client_front.py — Versão cliente do painel ISS (WS-only, sem ARQ)
 #
-# Agora:
-# - TUDO fala com Redis via WebSocket (AsyncRedisWS) apontando para wss://redisrender.onrender.com
-# - Sessões, runs, logs, e **enqueue_job** direto na fila do ARQ.
-# - NÃO existe mais PRÉ-FILA Y.
-# - NÃO existe conexão TCP direta, nem host, nem porta, nem RedisSettings aqui.
-# - A lógica de fila usa pick_queue_for_colab (igual seu script que funciona).
+# Este front se conecta DIRETO ao Redis via WebSocket (sem proxy TCP local).
+# - Enfileira jobs por CNPJ/etapa na pré-fila Y.
+# - Mostra status por EXECUÇÃO (cada clique em "Lançar Execução" por CNPJ).
+# - Exibe logs por EXECUÇÃO / por JOB.
+# - Stop All (limpa a pré-fila Y do tenant).
+#
+# IMPORTANTE:
+#   - Para WS configure:
+#       REDIS_WS_URL  (ex: wss://redisrender.onrender.com)
+#       REDIS_TOKEN   (opcional)
+#
+#   - NÃO há mais ARQ aqui. O consumo da fila (worker) deve ser feito
+#     lendo os envs da pré-fila Y (por ex.: BLPOP/BRPOP nas listas
+#     iss:y:colab:<colab_norm>).
 
 import os
 import time
 import uuid
 import json
+import asyncio
 from typing import Dict, Any, List, Optional
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Form  # type: ignore
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-import requests
-
-# WS client que você já tem
+# === WS client simples ===
 from redis_ws_client import AsyncRedisWS
-
-# usa a mesma lógica de fila que o seu script que funciona
-from main import pick_queue_for_colab
 
 # ===================== CONFIG =====================
 
-# Conexão via WebSocket (para sessão, runs, logs, enqueue_job, tudo)
+# Conexão direta via WebSocket
 REDIS_WS_URL = os.getenv("REDIS_WS_URL", "wss://redisrender.onrender.com")
 REDIS_TOKEN = os.getenv("REDIS_TOKEN", "")
 
 REDIS_LOG_NS = os.getenv("REDIS_LOG_NS", "iss")
+PREQUEUE_NS = os.getenv("PREQUEUE_NS", f"{REDIS_LOG_NS}:y")
+PREQUEUE_COLABS_SET = f"{PREQUEUE_NS}:colabs"
+
 FRONT_LAST_RUN_KEY = f"{REDIS_LOG_NS}:front:last_run_ts"
 
-# Flag informativa pro front: usamos ARQ (mas pelo WS)
-ARQ_ENABLED = True
+# Flag apenas informativa para o front (sempre false agora)
+ARQ_ENABLED = False
 
 # ===================== SESSÕES =====================
 
@@ -79,12 +86,73 @@ def task_logs_key(job_id: str) -> str:
     return f"{REDIS_LOG_NS}:task:{job_id}:logs"
 
 
+def extract_meta(function: str, args: List[Any], kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extrai metadados a partir do function/args usados nos jobs.
+    """
+    meta = {
+        "cnpj": "",
+        "colaborador": "",
+        "colaborador_norm": "",
+        "mes": "",
+        "etapa": function or "",
+    }
+    try:
+        if function == "job_notas" and len(args) >= 4:
+            colab_norm, cnpj, mes = str(args[0]), str(args[1]), str(args[2])
+            meta.update(
+                {
+                    "colaborador_norm": colab_norm,
+                    "colaborador": colab_norm,
+                    "cnpj": cnpj,
+                    "mes": mes,
+                    "etapa": "notas",
+                }
+            )
+        elif function == "job_escrituracao" and len(args) >= 4:
+            colab_norm, cnpj, mes = str(args[0]), str(args[1]), str(args[2])
+            meta.update(
+                {
+                    "colaborador_norm": colab_norm,
+                    "colaborador": colab_norm,
+                    "cnpj": cnpj,
+                    "mes": mes,
+                    "etapa": "escrituracao",
+                }
+            )
+        elif function == "job_certidao" and len(args) >= 4:
+            colab_norm, cnpj, mes = str(args[0]), str(args[1]), str(args[2])
+            meta.update(
+                {
+                    "colaborador_norm": colab_norm,
+                    "colaborador": colab_norm,
+                    "cnpj": cnpj,
+                    "mes": mes,
+                    "etapa": "certidao",
+                }
+            )
+        elif function == "job_dam" and len(args) >= 3:
+            colab_norm, cnpj = str(args[0]), str(args[1])
+            meta.update(
+                {
+                    "colaborador_norm": colab_norm,
+                    "colaborador": colab_norm,
+                    "cnpj": cnpj,
+                    "etapa": "dam",
+                }
+            )
+    except Exception:
+        pass
+    return meta
+
+
 STATUS_PRIORITY = {
     "pending": 0,
-    "queued": 1,
-    "running": 2,
-    "success": 3,
-    "error": 3,
+    "waiting": 1,
+    "queued": 2,
+    "running": 3,
+    "success": 4,
+    "error": 4,
 }
 
 
@@ -96,7 +164,7 @@ def merge_status(current: str, new: str) -> str:
 
 # ===================== APP =====================
 
-app = FastAPI(title="ISS Queue Front (Cliente) — WS-only, ARQ direto")
+app = FastAPI(title="ISS Queue Front (Cliente) — WS only, sem ARQ")
 
 app.add_middleware(
     CORSMiddleware,
@@ -126,9 +194,7 @@ async def get_session_from_request(request: Request) -> Optional[Dict[str, Any]]
         return None
 
 
-# ===================== HTML SIMPLES (placeholder) =====================
-
-
+# ===================== HTML LOGIN =====================
 
 PAGE_LOGIN = """<!doctype html>
 <html lang="pt-br">
@@ -177,6 +243,89 @@ PAGE_LOGIN = """<!doctype html>
 </html>
 """
 
+# ATENÇÃO: PAGE_CLIENT (HTML principal do painel) continua igual ao seu código anterior.
+# Aqui assumimos que ela já está definida em outro trecho do arquivo original:
+# PAGE_CLIENT = "..."
+
+
+# ===================== AUTH MIDDLEWARE =====================
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    path = request.url.path
+    if (
+        path.startswith("/docs")
+        or path.startswith("/openapi")
+        or path.startswith("/redoc")
+        or path.startswith("/static")
+        or path in ("/login", "/logout")
+    ):
+        return await call_next(request)
+
+    if path == "/" or path.startswith("/api"):
+        sess = await get_session_from_request(request)
+        if not sess:
+            if path.startswith("/api"):
+                return JSONResponse({"detail": "Não autenticado"}, status_code=401)
+            else:
+                return HTMLResponse(PAGE_LOGIN)
+        request.state.session = sess
+    return await call_next(request)
+
+
+# ===================== STARTUP / SHUTDOWN =====================
+
+
+@app.on_event("startup")
+async def startup():
+    # Conecta direto por WebSocket
+    app.state.redis = AsyncRedisWS(REDIS_WS_URL, token=REDIS_TOKEN)
+    try:
+        await app.state.redis.connect()
+        ok = await app.state.redis.ping()
+        if ok:
+            print(f"[startup] Conectado ao Redis via WebSocket: {REDIS_WS_URL}")
+        else:
+            print(f"[startup] ERRO: ping falhou em {REDIS_WS_URL}")
+    except Exception as e:
+        print(f"[startup] ERRO WS {REDIS_WS_URL}: {e!r}")
+
+    asyncio.create_task(scheduler_y_to_arq())
+
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    try:
+        await app.state.redis.aclose()
+    except Exception:
+        pass
+    print("Shutdown concluído (WS fechado).")
+
+
+# ===================== RUNS PERSISTÊNCIA =====================
+
+
+async def load_runs(rd: AsyncRedisWS, tenant: str) -> Dict[str, Dict[str, Any]]:
+    if not tenant:
+        return {}
+    raw = await rd.get(runs_key_for(tenant))
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+async def save_runs(rd: AsyncRedisWS, tenant: str, data: Dict[str, Dict[str, Any]]):
+    if not tenant:
+        return
+    await rd.set(runs_key_for(tenant), json.dumps(data))
+
+
+# ===================== ROTAS =====================
 
 PAGE_CLIENT = """<!doctype html>
 <html lang="pt-br">
@@ -1605,102 +1754,9 @@ PAGE_CLIENT = """<!doctype html>
 </html>
 """
 
-
-
-# ===================== AUTH MIDDLEWARE =====================
-
-
-@app.middleware("http")
-async def auth_middleware(request: Request, call_next):
-    path = request.url.path
-    if (
-        path.startswith("/docs")
-        or path.startswith("/openapi")
-        or path.startswith("/redoc")
-        or path.startswith("/static")
-        or path in ("/login", "/logout")
-    ):
-        return await call_next(request)
-
-    if path == "/" or path.startswith("/api"):
-        sess = await get_session_from_request(request)
-        if not sess:
-            if path.startswith("/api"):
-                return JSONResponse({"detail": "Não autenticado"}, status_code=401)
-            else:
-                return HTMLResponse(PAGE_LOGIN)
-        request.state.session = sess
-    return await call_next(request)
-
-
-# ===================== STARTUP / SHUTDOWN =====================
-
-
-@app.on_event("startup")
-async def startup():
-    # WS (sessões, runs, logs, enqueue_job, tudo)
-    app.state.redis = AsyncRedisWS(REDIS_WS_URL, token=REDIS_TOKEN)
-    try:
-        await app.state.redis.connect()
-        ok = await app.state.redis.ping()
-        if ok:
-            print(f"[startup] Conectado ao Redis via WebSocket: {REDIS_WS_URL}")
-        else:
-            print(f"[startup] ERRO: ping falhou em {REDIS_WS_URL}")
-    except Exception as e:
-        print(f"[startup] ERRO WS {REDIS_WS_URL}: {e!r}")
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    try:
-        await app.state.redis.aclose()
-    except Exception:
-        pass
-    print("Shutdown concluído (WS fechado).")
-
-
-# ===================== RUNS PERSISTÊNCIA =====================
-
-
-async def load_runs(rd: AsyncRedisWS, tenant: str) -> Dict[str, Dict[str, Any]]:
-    if not tenant:
-        return {}
-    raw = await rd.get(runs_key_for(tenant))
-    if not raw:
-        return {}
-    # raw pode ser None, bytes, str, ou até uma string JSON duplamente-serializada.
-    try:
-        if isinstance(raw, (bytes, bytearray)):
-            raw = raw.decode(errors="ignore")
-        if isinstance(raw, str):
-            data = json.loads(raw)
-            if isinstance(data, dict):
-                return data
-            if isinstance(data, str):
-                try:
-                    data2 = json.loads(data)
-                    if isinstance(data2, dict):
-                        return data2
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    print("[load_runs] dado corrompido para runs:", repr(str(raw)[:500]))
-    return {}
-
-
-async def save_runs(rd: AsyncRedisWS, tenant: str, data: Dict[str, Dict[str, Any]]):
-    if not tenant:
-        return
-    await rd.set(runs_key_for(tenant), json.dumps(data))
-
-
-# ===================== ROTAS BÁSICAS =====================
-
-
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
+    # PAGE_CLIENT deve estar definida no seu código original
     return HTMLResponse(PAGE_CLIENT)
 
 
@@ -1768,9 +1824,7 @@ async def logout(request: Request):
 
 @app.get("/api/me")
 async def api_me(request: Request):
-    sess = getattr(request.state, "session", None) or await get_session_from_request(
-        request
-    )
+    sess = getattr(request.state, "session", None) or await get_session_from_request(request)
     if not sess:
         raise HTTPException(401, "Não autenticado")
     return {
@@ -1779,82 +1833,19 @@ async def api_me(request: Request):
     }
 
 
-# ===================== ENQUEUE DIRETO NO ARQ (via WS) =====================
-
-
-def infer_status_from_logs(log_lines: List[str]) -> str:
-    """
-    Dado uma lista de linhas de log de um job, tenta inferir status.
-    - Sem log = "queued"
-    - Se tiver palavras de erro = "error"
-    - Senão = "success"
-    """
-    if not log_lines:
-        return "queued"
-    joined = "\n".join(log_lines).lower()
-    if any(w in joined for w in ["erro", "error", "exception", "traceback", "failed"]):
-        return "error"
-    return "success"
-
-
-async def build_status_index_for_runs(
-    rd: AsyncRedisWS, runs: Dict[str, Dict[str, Any]]
-) -> Dict[str, Dict[str, str]]:
-    """
-    Retorna um dict:
-      { run_id: { "escrituracao": status, "notas": status, "dam": status, "certidao": status } }
-    baseado nos logs de cada job do run.
-    """
-    status_per_run: Dict[str, Dict[str, str]] = {}
-
-    for run_id, run in runs.items():
-        etapas_status = {
-            "escrituracao": "pending",
-            "notas": "pending",
-            "dam": "pending",
-            "certidao": "pending",
-        }
-
-        jobs_meta: List[Dict[str, Any]] = run.get("jobs") or []
-        if not jobs_meta:
-            for jid in run.get("job_ids") or []:
-                jobs_meta.append({"job_id": jid, "etapa": None})
-
-        etapa_to_status: Dict[str, str] = {}
-
-        for jm in jobs_meta:
-            jid = jm.get("job_id")
-            etapa = (jm.get("etapa") or "").lower() or "notas"
-            try:
-                raw_logs = await rd.lrange(task_logs_key(jid), 0, -1)
-            except Exception:
-                raw_logs = []
-            st = infer_status_from_logs(raw_logs)
-            current = etapa_to_status.get(etapa, "pending")
-            etapa_to_status[etapa] = merge_status(current, st)
-
-        for e in etapas_status.keys():
-            if e in etapa_to_status:
-                etapas_status[e] = etapa_to_status[e]
-
-        status_per_run[run_id] = etapas_status
-
-    return status_per_run
-
-
 @app.post("/api/enqueue")
 async def api_enqueue(request: Request, payload: Dict[str, Any]):
     """
-    Enfileira jobs:
-      1) Cria execuções (runs) por CNPJ.
-      2) Enfileira DIRETO na fila do ARQ via AsyncRedisWS.enqueue_job
-         (igual seu script que funciona, só que pelo WS).
+    Enfileira jobs na PRÉ-FILA Y, por colaborador.
+
+    - Cada job vira um JSON `env` armazenado em:
+        iss:y:colab:<colaborador_norm>  (RPUSH)
+    - E o colaborador é registrado em:
+        iss:y:colabs                     (SADD)
     """
     rd = rds()
 
-    sess = getattr(request.state, "session", None) or await get_session_from_request(
-        request
-    )
+    sess = getattr(request.state, "session", None) or await get_session_from_request(request)
     if not sess:
         raise HTTPException(401, "Não autenticado")
     tenant = sess.get("colaborador_norm")
@@ -1915,7 +1906,6 @@ async def api_enqueue(request: Request, payload: Dict[str, Any]):
 
         run_id = uuid.uuid4().hex
         run_job_ids: List[str] = []
-        run_jobs_meta: List[Dict[str, Any]] = []
         run_etapas_flags = {
             "escrituracao": False,
             "notas": False,
@@ -1924,9 +1914,6 @@ async def api_enqueue(request: Request, payload: Dict[str, Any]):
         }
 
         codigo_dom = (c.get("dominio") or "").strip() or None
-
-        # usa mesma lógica de fila do seu script
-        queue_name = pick_queue_for_colab(colaborador_norm)
 
         for etapa_key, enabled in etapas.items():
             if not enabled:
@@ -1956,36 +1943,21 @@ async def api_enqueue(request: Request, payload: Dict[str, Any]):
                 ]
 
             job_id = uuid.uuid4().hex
+            env = {
+                "func": func,
+                "args": args,
+                # Mantemos _job_id para identificação nos logs e front,
+                # mas não existe mais _queue_name/ARQ.
+                "enqueue_kwargs": {"_job_id": job_id},
+                "colaborador_norm": colaborador_norm,
+            }
 
-            # Enfileira direto no ARQ **via WS**.
-            # Assumindo que AsyncRedisWS tem a mesma assinatura de enqueue_job
-            # que o ArqRedis (como o seu proxy implementa).
-            job = await rd.enqueue_job(
-                func,
-                *args,
-                _job_id=job_id,
-                _queue_name=queue_name,
-            )
-
-            # job pode ser None se já existia; o importante é o job_id
-            if job is None:
-                print(f"[enqueue] Job {job_id} já existia, não reenfileirado.")
-            else:
-                try:
-                    print(f"[enqueue] Job {job.job_id} → {func}{tuple(args)}")
-                except Exception:
-                    print(f"[enqueue] Job {job_id} → {func}{tuple(args)}")
-
+            y_key = f"{PREQUEUE_NS}:colab:{colaborador_norm}"
+            await rd.sadd(PREQUEUE_COLABS_SET, colaborador_norm)
+            await rd.rpush(y_key, json.dumps(env))
             total_jobs += 1
+
             run_job_ids.append(job_id)
-            run_jobs_meta.append(
-                {
-                    "job_id": job_id,
-                    "etapa": etapa_key,
-                    "func": func,
-                    "queue": queue_name,
-                }
-            )
             run_etapas_flags[etapa_key] = True
 
         if run_job_ids:
@@ -1997,7 +1969,6 @@ async def api_enqueue(request: Request, payload: Dict[str, Any]):
                 "mes_str": mes_str,
                 "etapas": run_etapas_flags,
                 "job_ids": run_job_ids,
-                "jobs": run_jobs_meta,
                 "account_id": account_id,
                 "provider": provider,
                 "tipo_estrutura": tipo_estrutura,
@@ -2021,9 +1992,6 @@ async def api_enqueue(request: Request, payload: Dict[str, Any]):
     }
 
 
-# ===================== KPIS / STATUS =====================
-
-
 @app.get("/api/kpis")
 async def api_kpis(request: Request):
     rd = rds()
@@ -2036,20 +2004,20 @@ async def api_kpis(request: Request):
 
     runs = await load_runs(rd, tenant)
 
+    rel_cnpjs: Dict[str, Dict[str, Any]] = {}
     distinct_cnpjs = set()
     for run in runs.values():
         cd = cnpj_digits(run.get("cnpj", ""))
-        if cd:
-            distinct_cnpjs.add(cd)
+        mes_str = run.get("mes_str") or ""
+        if not cd:
+            continue
+        distinct_cnpjs.add(cd)
+        key = f"{cd}:{mes_str}" if mes_str else cd
+        rel_cnpjs[key] = {"cnpj": cd, "mes": mes_str}
 
-    status_idx = await build_status_index_for_runs(rd, runs)
-
-    running_count = 0  # aqui não usamos "running" real
-    queue_count = 0
-    for etapas in status_idx.values():
-        for st in etapas.values():
-            if st == "queued":
-                queue_count += 1
+    idx = await build_status_index(rel_cnpjs, allowed_colab_prefix=tenant)
+    kpis = idx["kpis"]
+    kpis["total_cnpjs"] = len(distinct_cnpjs)
 
     last_raw = await rd.get(FRONT_LAST_RUN_KEY)
     last_str = "—"
@@ -2059,15 +2027,136 @@ async def api_kpis(request: Request):
             last_str = time.strftime("%d/%m %H:%M", time.localtime(ts))
         except Exception:
             pass
-
-    kpis = {
-        "running": running_count,
-        "queue": queue_count,
-        "total_cnpjs": len(distinct_cnpjs),
-        "last_run_str": last_str,
-        "arq_enabled": ARQ_ENABLED,
-    }
+    kpis["last_run_str"] = last_str
+    kpis["arq_enabled"] = ARQ_ENABLED
     return {"kpis": kpis}
+
+
+async def build_status_index(
+    relevant_cnpjs: Dict[str, Dict[str, Any]],
+    allowed_colab_prefix: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Monta índice de status por CNPJ/mes baseado:
+      - PRÉ-FILA Y (waiting)
+      - (sem ARQ agora; status de sucesso/erro podem ser inferidos via logs em endpoints específicos)
+    """
+    rd: AsyncRedisWS = rds()
+    job_events: Dict[str, Dict[str, Any]] = {}
+    etapas = ["escrituracao", "notas", "dam", "certidao"]
+
+    keys = list(relevant_cnpjs.keys())
+    if not keys:
+        return {
+            "status_per_cnpj": {},
+            "job_events": {},
+            "kpis": {"running": 0, "queue": 0, "total_cnpjs": 0},
+        }
+
+    events: Dict[str, Dict[str, List[Dict[str, Any]]]] = {
+        k: {e: [] for e in etapas} for k in keys
+    }
+
+    running_count = 0  # sem ARQ não sabemos quem está rodando
+    queue_count = 0
+
+    def add_job_event(job_id: Optional[str], cd: str, mes: str, etapa: str, status: str):
+        if not job_id:
+            return
+        prev = job_events.get(job_id)
+        if not prev:
+            job_events[job_id] = {
+                "cnpj": cd,
+                "mes": mes or "",
+                "etapa": etapa,
+                "status": status,
+            }
+        else:
+            prev_status = prev.get("status", "pending")
+            if STATUS_PRIORITY.get(status, 0) >= STATUS_PRIORITY.get(prev_status, 0):
+                prev.update(
+                    {
+                        "status": status,
+                        "cnpj": cd or prev.get("cnpj", ""),
+                        "mes": mes or prev.get("mes", ""),
+                        "etapa": etapa or prev.get("etapa", ""),
+                    }
+                )
+
+    def append_to_event_maps(cd: str, mes: str, etapa: str, st_str: str, job_id: str):
+        key1 = cd
+        key2 = f"{cd}:{mes}" if mes else None
+        if key2 and key2 in events:
+            events[key2].setdefault(etapa, []).append(
+                {"status": st_str, "job_id": job_id}
+            )
+        if key1 in events:
+            events[key1].setdefault(etapa, []).append(
+                {"status": st_str, "job_id": job_id}
+            )
+
+    # --- Apenas PRÉ-FILA Y (waiting) ---
+    try:
+        colabs = await rd.smembers(PREQUEUE_COLABS_SET)
+    except Exception:
+        colabs = []
+
+    for colab in colabs:
+        y_key = f"{PREQUEUE_NS}:colab:{colab}"
+        try:
+            raw_items = await rd.lrange(y_key, 0, -1)
+        except Exception:
+            raw_items = []
+        for raw in raw_items:
+            try:
+                env = json.loads(raw)
+            except Exception:
+                continue
+            func = env.get("func") or ""
+            args = env.get("args") or []
+            meta = extract_meta(func, args, {})
+            cd = cnpj_digits(meta["cnpj"])
+            mes = meta.get("mes", "") or ""
+            etapa = meta["etapa"] or func
+            colab_norm = meta.get("colaborador_norm") or ""
+            if allowed_colab_prefix and not str(colab_norm).startswith(
+                allowed_colab_prefix
+            ):
+                continue
+            jid = env.get("enqueue_kwargs", {}).get("_job_id")
+            st_str = "waiting"
+            append_to_event_maps(cd, mes, etapa, st_str, jid)
+            add_job_event(jid, cd, mes, etapa, st_str)
+            queue_count += 1
+
+    def reduce_status(lst: List[Dict[str, Any]]) -> str:
+        if not lst:
+            return "pending"
+        flags = {e["status"] for e in lst}
+        if "success" in flags and "error" not in flags:
+            return "success"
+        if "running" in flags:
+            return "running"
+        if "queued" in flags or "waiting" in flags:
+            return "waiting"
+        if "error" in flags:
+            return "error"
+        return "pending"
+
+    status_per_cnpj: Dict[str, Dict[str, str]] = {}
+    for key in events:
+        s = {etapa: reduce_status(events[key].get(etapa, [])) for etapa in etapas}
+        status_per_cnpj[key] = s
+
+    return {
+        "status_per_cnpj": status_per_cnpj,
+        "job_events": job_events,
+        "kpis": {
+            "running": running_count,
+            "queue": queue_count,
+            "total_cnpjs": len(keys),
+        },
+    }
 
 
 @app.get("/api/status")
@@ -2081,7 +2170,16 @@ async def api_status(request: Request):
     tenant = sess.get("colaborador_norm", "")
 
     runs = await load_runs(rd, tenant)
-    status_idx = await build_status_index_for_runs(rd, runs)
+    rel_cnpjs: Dict[str, Dict[str, Any]] = {}
+    for run in runs.values():
+        cd = cnpj_digits(run.get("cnpj", ""))
+        mes_str = run.get("mes_str") or ""
+        if cd:
+            key = f"{cd}:{mes_str}" if mes_str else cd
+            rel_cnpjs[key] = {"cnpj": cd, "mes": mes_str}
+    idx = await build_status_index(rel_cnpjs, allowed_colab_prefix=tenant)
+    kpis = idx["kpis"]
+    job_events: Dict[str, Dict[str, Any]] = idx.get("job_events", {})
 
     def reduce_status_list(statuses: List[str]) -> str:
         if not statuses:
@@ -2096,17 +2194,28 @@ async def api_status(request: Request):
         cd = cnpj_digits(run.get("cnpj", ""))
         if not cd:
             continue
+        job_ids: List[str] = run.get("job_ids") or []
+        etapas_status = {
+            "escrituracao": "pending",
+            "notas": "pending",
+            "dam": "pending",
+            "certidao": "pending",
+        }
+        etapa_to_statuses: Dict[str, List[str]] = {
+            k: [] for k in etapas_status.keys()
+        }
 
-        etapas_status = status_idx.get(
-            run_id,
-            {
-                "escrituracao": "pending",
-                "notas": "pending",
-                "dam": "pending",
-                "certidao": "pending",
-            },
-        )
+        for jid in job_ids:
+            je = job_events.get(jid)
+            if not je:
+                continue
+            etapa = (je.get("etapa") or "").lower()
+            st = je.get("status") or "pending"
+            if etapa in etapa_to_statuses:
+                etapa_to_statuses[etapa].append(st)
 
+        for e in etapa_to_statuses:
+            etapas_status[e] = reduce_status_list(etapa_to_statuses[e])
         geral_status = reduce_status_list(list(etapas_status.values()))
 
         rows.append(
@@ -2123,12 +2232,7 @@ async def api_status(request: Request):
             }
         )
     rows.sort(key=lambda r: (r["cnpj_digits"], r["ano"], r["mes"], r["run_id"]))
-
-    kpis_resp = (await api_kpis(request))["kpis"]  # type: ignore
-    return {"rows": rows, "kpis": kpis_resp, "arq_enabled": ARQ_ENABLED}
-
-
-# ===================== LOGS =====================
+    return {"rows": rows, "kpis": kpis, "arq_enabled": ARQ_ENABLED}
 
 
 @app.get("/api/logs/{cnpj}")
@@ -2141,43 +2245,57 @@ async def api_logs_for_cnpj(request: Request, cnpj: str):
     if not sess:
         raise HTTPException(401, "Não autenticado")
     tenant = sess.get("colaborador_norm", "")
+    colab_prefix = tenant + "::" if tenant else ""
 
     cn = cnpj_digits(cnpj.strip().replace(".", "").replace("/", "").replace("-", ""))
     mes = (request.query_params.get("mes") or "").zfill(2)
     ano = (request.query_params.get("ano") or "").strip()
-    mes_key = f"{mes}/{ano}" if mes and ano else ""
-
-    runs = await load_runs(rd, tenant)
-
-    relevant_runs = []
-    for r in runs.values():
-        if cnpj_digits(r.get("cnpj", "")) != cn:
-            continue
-        if mes_key and (r.get("mes_str") or "") != mes_key:
-            continue
-        relevant_runs.append(r)
-
-    status_idx = await build_status_index_for_runs(
-        rd, {r["id"]: r for r in relevant_runs}
+    mes_key = f"{mes}/{ano}" if mes and ano else (mes if mes else "")
+    key = f"{cn}:{mes_key}" if mes_key else cn
+    rel_cnpjs = {key: {"cnpj": cn, "mes": mes_key}}
+    idx = await build_status_index(rel_cnpjs, allowed_colab_prefix=tenant)
+    etapas_status = idx["status_per_cnpj"].get(key) or idx["status_per_cnpj"].get(
+        cn, {}
     )
 
-    etapas_status = {
-        "escrituracao": "pending",
-        "notas": "pending",
-        "dam": "pending",
-        "certidao": "pending",
-    }
-    for r in relevant_runs:
-        rs = status_idx.get(r["id"], {})
-        for k, v in rs.items():
-            etapas_status[k] = merge_status(etapas_status.get(k, "pending"), v)
-
-    job_ids_for_cnpj = set()
-    for r in relevant_runs:
-        for jid in (r.get("job_ids") or []):
-            job_ids_for_cnpj.add(jid)
-
     logs_lines: List[str] = []
+    job_ids_for_cnpj = set()
+
+    # Adiciona jobs a partir dos RUNS (execuções deste usuário)
+    runs = await load_runs(rd, tenant)
+    for r in runs.values():
+        if cnpj_digits(r.get("cnpj", "")) == cn:
+            for jid in (r.get("job_ids") or []):
+                job_ids_for_cnpj.add(jid)
+
+    # Pré-fila Y
+    try:
+        colabs = await rd.smembers(PREQUEUE_COLABS_SET)
+    except Exception:
+        colabs = []
+    for colab in colabs:
+        if colab_prefix and not str(colab).startswith(colab_prefix):
+            continue
+        y_key = f"{PREQUEUE_NS}:colab:{colab}"
+        try:
+            raw_items = await rd.lrange(y_key, 0, -1)
+        except Exception:
+            raw_items = []
+        for raw_item in raw_items:
+            try:
+                env = json.loads(raw_item)
+            except Exception:
+                continue
+            meta = extract_meta(env.get("func") or "", env.get("args") or [], {})
+            colab_norm = meta.get("colaborador_norm") or ""
+            if colab_prefix and not colab_norm.startswith(colab_prefix):
+                continue
+            if cnpj_digits(meta["cnpj"]) == cn:
+                jid = env.get("enqueue_kwargs", {}).get("_job_id", "")
+                if jid:
+                    job_ids_for_cnpj.add(jid)
+
+    # Carrega logs detalhados
     for jid in sorted(job_ids_for_cnpj):
         try:
             jlogs = await rd.lrange(task_logs_key(jid), 0, -1)
@@ -2191,7 +2309,12 @@ async def api_logs_for_cnpj(request: Request, cnpj: str):
         "cnpj": cn,
         "cnpj_mask": mask_cnpj(cn),
         "razao": "",
-        "etapas": etapas_status,
+        "etapas": {
+            "escrituracao": etapas_status.get("escrituracao", "pending"),
+            "notas": etapas_status.get("notas", "pending"),
+            "dam": etapas_status.get("dam", "pending"),
+            "certidao": etapas_status.get("certidao", "pending"),
+        },
         "logs": "\n".join(logs_lines),
         "arq_enabled": ARQ_ENABLED,
     }
@@ -2207,64 +2330,98 @@ async def api_logs_for_job(request: Request, job_id: str):
     if not sess:
         raise HTTPException(401, "Não autenticado")
     tenant = sess.get("colaborador_norm", "")
-
-    runs = await load_runs(rd, tenant)
+    colab_prefix = tenant + "::" if tenant else ""
 
     cn = ""
     etapa = ""
-    mes_str = ""
     status = "pending"
+    mes = ""
 
-    for r in runs.values():
-        job_ids = r.get("job_ids") or []
-        if job_id not in job_ids:
+    # 1) Tenta achar na PRÉ-FILA Y
+    try:
+        colabs = await rd.smembers(PREQUEUE_COLABS_SET)
+    except Exception:
+        colabs = []
+    for colab in colabs:
+        if colab_prefix and not str(colab).startswith(colab_prefix):
             continue
-        cn = cnpj_digits(r.get("cnpj", ""))
-        mes_str = r.get("mes_str") or ""
-        jobs_meta = r.get("jobs") or []
-        for jm in jobs_meta:
-            if jm.get("job_id") == job_id:
-                etapa = jm.get("etapa") or ""
+        y_key = f"{PREQUEUE_NS}:colab:{colab}"
+        try:
+            raw_items = await rd.lrange(y_key, 0, -1)
+        except Exception:
+            raw_items = []
+        found = False
+        for raw_item in raw_items:
+            try:
+                env = json.loads(raw_item)
+            except Exception:
+                continue
+            jid = env.get("enqueue_kwargs", {}).get("_job_id")
+            if jid != job_id:
+                continue
+            func = env.get("func") or ""
+            args = env.get("args") or []
+            meta = extract_meta(func, args, {})
+            colab_norm = meta.get("colaborador_norm") or ""
+            if colab_prefix and not colab_norm.startswith(colab_prefix):
+                continue
+            cn = cnpj_digits(meta["cnpj"])
+            etapa = meta.get("etapa") or func
+            mes = meta.get("mes") or ""
+            status = "waiting"
+            found = True
+            break
+        if found:
+            break
+
+    # 2) Se ainda não achou, tenta localizar via RUNS (apenas cnpj/mes)
+    if not cn:
+        runs = await load_runs(rd, tenant)
+        for r in runs.values():
+            if job_id in (r.get("job_ids") or []):
+                cn = cnpj_digits(r.get("cnpj", ""))
+                mes = r.get("mes_str") or ""
+                if not mes:
+                    mes_only = (r.get("mes") or "").zfill(2)
+                    ano_only = str(r.get("ano") or "").strip()
+                    mes = (
+                        f"{mes_only}/{ano_only}"
+                        if mes_only and ano_only
+                        else (mes_only or "")
+                    )
                 break
-        break
 
     if not cn:
         raise HTTPException(404, "Job não encontrado para este usuário.")
 
+    # 3) Carrega logs do job e tenta inferir status final
     try:
         jlogs = await rd.lrange(task_logs_key(job_id), 0, -1)
     except Exception:
         jlogs = []
     logs = "\n".join(jlogs or [])
-    status = infer_status_from_logs(jlogs)
+
+    if jlogs:
+        lower = "\n".join(jlogs).lower()
+        if any(w in lower for w in ["erro", "error", "exception", "traceback", "failed"]):
+            status = "error"
+        elif status != "waiting":
+            # se não está waiting na pré-fila e tem logs, consideramos "success" por simplicidade
+            status = "success"
 
     etapas_status: Dict[str, str] = {}
     if cn:
-        relevant_runs = []
-        for r in runs.values():
-            if cnpj_digits(r.get("cnpj", "")) != cn:
-                continue
-            if mes_str and (r.get("mes_str") or "") != mes_str:
-                continue
-            relevant_runs.append(r)
-        status_idx = await build_status_index_for_runs(
-            rd, {r["id"]: r for r in relevant_runs}
+        key = f"{cn}:{mes}" if mes else cn
+        rel_cnpjs = {key: {"cnpj": cn, "mes": mes}}
+        idx = await build_status_index(rel_cnpjs, allowed_colab_prefix=tenant)
+        etapas_status = idx["status_per_cnpj"].get(key) or idx["status_per_cnpj"].get(
+            cn, {}
         )
-        etapas_status = {
-            "escrituracao": "pending",
-            "notas": "pending",
-            "dam": "pending",
-            "certidao": "pending",
-        }
-        for r in relevant_runs:
-            rs = status_idx.get(r["id"], {})
-            for k, v in rs.items():
-                etapas_status[k] = merge_status(etapas_status.get(k, "pending"), v)
 
     return {
         "job_id": job_id,
         "cnpj": cn,
-        "cnpj_mask": mask_cnpj(cn),
+        "cnpj_mask": mask_cnpj(cn) if cn else "",
         "razao": "",
         "etapa": etapa,
         "status": status,
@@ -2296,19 +2453,41 @@ async def api_logs_for_run(request: Request, run_id: str):
 
     cn = cnpj_digits(run.get("cnpj", ""))
 
-    status_idx = await build_status_index_for_runs(rd, {run_id: run})
-    etapas_status_run = status_idx.get(
-        run_id,
-        {
-            "escrituracao": "pending",
-            "notas": "pending",
-            "dam": "pending",
-            "certidao": "pending",
-        },
-    )
+    # Para o índice de etapas, usamos apenas PRÉ-FILA
+    rel_cnpjs = {cn: {"cnpj": cn}}
+    idx = await build_status_index(rel_cnpjs, allowed_colab_prefix=tenant)
+    job_events = idx.get("job_events", {})
+
+    job_ids: List[str] = run.get("job_ids") or []
+    etapa_to_statuses: Dict[str, List[str]] = {
+        "escrituracao": [],
+        "notas": [],
+        "dam": [],
+        "certidao": [],
+    }
+    for jid in job_ids:
+        je = job_events.get(jid)
+        if not je:
+            continue
+        etapa = (je.get("etapa") or "").lower()
+        st = je.get("status") or "pending"
+        if etapa in etapa_to_statuses:
+            etapa_to_statuses[etapa].append(st)
+
+    def reduce_status_list(statuses: List[str]) -> str:
+        if not statuses:
+            return "pending"
+        cur = "pending"
+        for st in statuses:
+            cur = merge_status(cur, st)
+        return cur
+
+    etapas_status_run: Dict[str, str] = {
+        e: reduce_status_list(etapa_to_statuses[e]) for e in etapa_to_statuses
+    }
 
     logs_lines: List[str] = []
-    for jid in (run.get("job_ids") or []):
+    for jid in job_ids:
         try:
             jlogs = await rd.lrange(task_logs_key(jid), 0, -1)
         except Exception:
@@ -2335,15 +2514,13 @@ async def api_logs_for_run(request: Request, run_id: str):
     }
 
 
-# ===================== STOP ALL =====================
-
-
 @app.post("/api/stop_all")
 async def api_stop_all(request: Request):
     """
-    Stop All:
-      - limpa apenas os RUNS desse usuário (reseta a tela).
-      - NÃO aborta jobs já enfileirados/rodando no ARQ.
+    Stop All agora só limpa a PRÉ-FILA Y do tenant.
+
+    (Sem ARQ, não tem mais "abort" de jobs numa fila externa;
+     quem consumir a fila deve respeitar isso se necessário.)
     """
     rd = rds()
 
@@ -2353,19 +2530,56 @@ async def api_stop_all(request: Request):
     if not sess:
         raise HTTPException(401, "Não autenticado")
     tenant = sess.get("colaborador_norm", "")
+    tenant_prefix = tenant + "::" if tenant else ""
 
-    await save_runs(rd, tenant, {})
+    runs = await load_runs(rd, tenant)
+    colabs = set()
+    try:
+        prequeue_colabs = await rd.smembers(PREQUEUE_COLABS_SET)
+        for c in prequeue_colabs:
+            if tenant_prefix and str(c).startswith(tenant_prefix):
+                colabs.add(str(c))
+    except Exception:
+        pass
+    for r in runs.values():
+        colab_norm = r.get("colaborador_norm")
+        if colab_norm and (
+            not tenant_prefix or str(colab_norm).startswith(tenant_prefix)
+        ):
+            colabs.add(str(colab_norm))
 
+    job_ids_to_abort = set()
+    for r in runs.values():
+        for jid in (r.get("job_ids") or []):
+            job_ids_to_abort.add(jid)
+
+    prequeue_removed = 0
+
+    for c in colabs:
+        key = f"{PREQUEUE_NS}:colab:{c}"
+        try:
+            n = await rd.llen(key)
+            if n and n > 0:
+                await rd.delete(key)
+                prequeue_removed += n
+        except Exception:
+            pass
+        try:
+            await rd.srem(PREQUEUE_COLABS_SET, c)
+        except Exception:
+            pass
+
+    # Sem ARQ, não há abort "real", então retornamos apenas info da pré-fila.
     return {
         "status": "ok",
         "stopped_jobs": 0,
-        "prequeue_removed": 0,
+        "prequeue_removed": prequeue_removed,
         "ids": [],
         "arq_enabled": ARQ_ENABLED,
     }
 
 
-# ===================== IMPORTAÇÃO XLSX =====================
+# ===================== IMPORTAÇÃO XLSX (parse) =====================
 
 
 @app.post("/api/import_cnpjs")
@@ -2407,7 +2621,9 @@ async def api_import_cnpjs(
     }
 
 
-# ===================== PCLOUD =====================
+# ===================== PCLOUD (igual ao seu) =====================
+
+import requests
 
 PCLOUD_API = "https://api.pcloud.com"
 PCLOUD_TOKEN = "MuRLgkZbz3P7ZeaIUlazWc9F7GAuXnBCeK4WPre7y"
@@ -2473,6 +2689,71 @@ async def api_download_zip(request: Request):
             500, f"Erro ao gerar ZIP no pCloud: {exc}"
         )
     return RedirectResponse(zip_url, status_code=302)
+
+
+# ==============================================================
+# SCHEDULER INTERNO — PRÉ-FILA Y ➜ ARQ (usando somente WebSocket)
+# ==============================================================
+
+import asyncio
+import json
+import pickle
+import time
+
+async def scheduler_y_to_arq():
+    print("[scheduler] iniciado!")
+    rd = app.state.redis
+
+    while True:
+        try:
+            colabs = await rd.smembers(PREQUEUE_COLABS_SET)
+            if not colabs:
+                await asyncio.sleep(1)
+                continue
+
+            for colab in colabs:
+                y_key = f"{PREQUEUE_NS}:colab:{colab}"
+
+                raw = await rd.lpop(y_key)
+                if not raw:
+                    continue
+
+                env = json.loads(raw)
+                func = env.get("func")
+                args_list = env.get("args") or []
+                job_id = env.get("enqueue_kwargs", {}).get("_job_id")
+
+                if not job_id:
+                    continue
+
+                # ===== FORMATO EXATO DE UM JOBDEF =====
+
+                now_ms = int(time.time() * 1000)
+
+                jobdef = {
+                    "t": 1,                      # job_try
+                    "f": func,                  # nome da função
+                    "a": tuple(args_list),      # args = tuple
+                    "k": {},                    # kwargs (vazio)
+                    "et": now_ms,               # enqueue_time_ms
+                }
+
+                # Gravar jobdef do jeito correto
+                await rd.set(f"arq:job:{job_id}", pickle.dumps(jobdef))
+
+                # Colocar job no ZSET da fila
+                await rd.zadd("arq:queue", now_ms, job_id)
+
+                print(f"[scheduler] job {job_id} → ARQ OK")
+
+        except Exception as e:
+            print("[scheduler] erro:", repr(e))
+
+        await asyncio.sleep(0.25)
+
+
+
+
 
 
 # ===================== MAIN =====================
