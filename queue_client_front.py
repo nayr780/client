@@ -1164,6 +1164,18 @@ PAGE_CLIENT = """<!doctype html>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script>
   document.addEventListener('DOMContentLoaded', () => {
+    // ---------- Delegated Tooltip (UMA instância somente) ----------
+    // Usa delegação para evitar criar muitas instâncias e travar o navegador.
+    try {
+      new bootstrap.Tooltip(document.body, {
+        selector: '[data-bs-toggle="tooltip"]',
+        trigger: 'hover focus'
+      });
+    } catch (e) {
+      // se bootstrap não estiver disponível por algum motivo, ignora
+      console.warn('Tooltip delegation init falhou:', e);
+    }
+
     const meses = ["Janeiro","Fevereiro","Março","Abril","Maio","Junho","Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"];
     const hoje = new Date();
     const mesSelect = document.getElementById('mes');
@@ -1208,6 +1220,7 @@ PAGE_CLIENT = """<!doctype html>
     const kpiLastRun = document.getElementById('kpi-last-run');
 
     const enfileirarResult = document.getElementById('enfileirar-result');
+    const btnEnfileirar = document.getElementById('btn-enfileirar');
 
     let ACCS = {};   // id -> account (apenas localStorage)
     let CNPJS = {};  // id -> cnpj   (apenas localStorage)
@@ -1573,6 +1586,7 @@ PAGE_CLIENT = """<!doctype html>
       const ic = iconByStatus[status] || 'bi-dot';
       const tt = titleByStatus[status] || status;
       const etapaPart = etapaName ? (etapaName + ': ') : '';
+      // mantém data-bs-toggle, title e delegação cuidará da instanciação
       return `<span class="status-etapa ${status}" data-bs-toggle="tooltip" title="${etapaPart}${tt}">
         <i class="bi ${ic}"></i>
       </span>`;
@@ -1634,8 +1648,7 @@ PAGE_CLIENT = """<!doctype html>
         tbodyStatus.appendChild(tr);
       });
 
-      const tooltipTriggerList = document.querySelectorAll('[data-bs-toggle="tooltip"]');
-      [...tooltipTriggerList].forEach(el => new bootstrap.Tooltip(el));
+      // NÃO criamos tooltips individualmente aqui — usamos delegação única inicializada no DOMContentLoaded
     }
 
     async function loadAll() {
@@ -1881,8 +1894,8 @@ PAGE_CLIENT = """<!doctype html>
     filterAccLancar.addEventListener('change', renderCnpjsLancar);
     filterDomLancar.addEventListener('change', renderCnpjsLancar);
 
-    // === Enfileirar execução ===
-    document.getElementById('btn-enfileirar').addEventListener('click', async () => {
+    // === Enfileirar execução (COM confirmação) ===
+    btnEnfileirar.addEventListener('click', async () => {
       const provider = document.getElementById('provider').value || '1';
       const mes = document.getElementById('mes').value;
       const ano = document.getElementById('ano').value;
@@ -1903,6 +1916,18 @@ PAGE_CLIENT = """<!doctype html>
         enfileirarResult.textContent = 'Selecione pelo menos um CNPJ.';
         return;
       }
+
+      // Confirmação clara para o usuário
+      const confirmMsg = `Tem certeza que deseja iniciar a execução para ${cnpj_ids.length} CNPJ(s)?\\nMês/Ano: ${mes}/${ano}`;
+      if (!confirm(confirmMsg)) {
+        return;
+      }
+
+      // feedback visual no botão
+      const originalHtml = btnEnfileirar.innerHTML;
+      btnEnfileirar.disabled = true;
+      btnEnfileirar.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Enfileirando...';
+
       try {
         const resp = await fetchJSON('/api/enqueue', {
           method: 'POST',
@@ -1925,6 +1950,9 @@ PAGE_CLIENT = """<!doctype html>
       } catch (err) {
         enfileirarResult.className = 'mt-3 small text-center text-danger';
         enfileirarResult.textContent = 'Erro ao enfileirar: ' + err.message;
+      } finally {
+        btnEnfileirar.disabled = false;
+        btnEnfileirar.innerHTML = originalHtml;
       }
     });
 
@@ -2128,6 +2156,7 @@ PAGE_CLIENT = """<!doctype html>
 </body>
 </html>
 """
+
 # ===================== ROTAS (REST) =====================
 
 @app.get("/")
@@ -2155,6 +2184,11 @@ async def do_login(request: Request):
         "legiscontabilidade": "iss2025@",
         "procontabil": "iss@2025",
         "laryssa": "123456",
+        "leticia-pro": "@iss2025",
+        "Alessandra-pro": "@iss2025",
+        "Euciene-pro": "@iss2025",
+        "Beatriz-pro": "@iss2025",
+        "Luan-pro": "@iss2025",
     }
     if colaborador not in validUsers or validUsers[colaborador] != senha:
         dbg("[login] inválido para", colaborador)
@@ -2174,14 +2208,16 @@ async def do_login(request: Request):
 async def logout(request: Request):
     rd = app.state.redis_cmd
     token = request.cookies.get(SESSION_COOKIE_NAME)
-    resp = JSONResponse({"status": "ok"})
+
     if token:
         try:
             await rd.delete(session_key(token))
             dbg("[logout] sessão removida", token[:8]+"…")
         except Exception as e:
             dbg("[logout] erro ao deletar sessão:", repr(e))
-        resp.delete_cookie(SESSION_COOKIE_NAME)
+
+    resp = RedirectResponse(url="/login", status_code=302)
+    resp.delete_cookie(SESSION_COOKIE_NAME)
     return resp
 
 @app.get("/api/me")
@@ -2759,50 +2795,107 @@ async def api_stop_all(request: Request):
     dbg(f"[stop_all] tenant={tenant} prequeue_removed={prequeue_removed}")
     return {"status": "ok","stopped_jobs": 0,"prequeue_removed": prequeue_removed,"ids": [],"arq_enabled": ARQ_ENABLED}
 
-# ===================== PCLOUD (opcional p/ ZIP) =====================
+# ================= PCLOUD (ZIP PÚBLICO 100% FUNCIONAL) =================
 
-PCLOUD_API = "https://api.pcloud.com"
+
+PCLOUD_API   = "https://api.pcloud.com"
 PCLOUD_TOKEN = "MuRLgkZbz3P7ZeaIUlazWc9F7GAuXnBCeK4WPre7y"
-PCLOUD_ROOT = "/issbot"
+PCLOUD_ROOT  = "/issbot"
 
-def _pcloud_request(method: str, endpoint: str, *, params=None, data=None, files=None) -> dict:
+def _pcloud_request(endpoint: str, *, params=None) -> dict:
+    """
+    Chama a API pCloud e retorna o JSON.
+    Lança RuntimeError se 'result' != 0.
+    """
     url = f"{PCLOUD_API}/{endpoint}"
-    p = dict(params or {}); p.setdefault("auth", PCLOUD_TOKEN)
-    r = requests.request(method, url, params=p, data=data, files=files, timeout=60)
-    r.raise_for_status()
-    js = r.json()
-    if js.get("result") != 0:
-        raise RuntimeError(js.get("error", f"Erro desconhecido na API pCloud ({endpoint})"))
+    p = dict(params or {})
+    p.setdefault("auth", PCLOUD_TOKEN)
+
+    resp = requests.get(url, params=p, timeout=30)
+    resp.raise_for_status()
+    js = resp.json()
+    if js.get("result") not in (0, True):
+        # Algumas rotas usam 'result': True
+        raise RuntimeError(js.get("error", f"Erro desconhecido em {endpoint}"))
     return js
 
+def ensure_folder_published(folderid: int) -> str:
+    """
+    Garante que a pasta já tenha um link público.
+    Tenta getfolderpublink → se 404, chama setpublink → então getfolderpublink de novo.
+    Retorna o 'code'.
+    """
+    try:
+        js = _pcloud_request("getfolderpublink", params={"folderid": folderid})
+        # resposta: { "result":0, "metadata":{...}, "code":"XYZ", ... }
+        return js["code"]
+    except requests.HTTPError as e:
+        # se deu 404, vamos publicar
+        if e.response.status_code == 404:
+            # cria novo
+            js2 = _pcloud_request("setpublink", params={"folderid": folderid})
+            code = js2.get("code")
+            if not code:
+                raise RuntimeError("Falha ao setpublink(publishfolder)")
+            # então recupera
+            js3 = _pcloud_request("getfolderpublink", params={"folderid": folderid})
+            return js3["code"]
+        raise
+
 def get_zip_url_for_subpath(remote_subpath: str) -> str:
+    """
+    Gera um URL para download do ZIP público.
+    """
     remote_subpath = (remote_subpath or "").strip("/")
     remote_path = f"{PCLOUD_ROOT}/{remote_subpath}"
-    js_link = _pcloud_request("get", "getfolderpublink", params={"path": remote_path})
-    code = (js_link.get("code") or js_link.get("linkid") or (js_link.get("metadata") or {}).get("code"))
-    if not code:
-        raise RuntimeError(f"Pasta não encontrada no pCloud: {remote_path}")
-    js_zip = _pcloud_request("get", "getpubziplink", params={"code": code})
-    hosts, zip_path = js_zip.get("hosts"), js_zip.get("path")
+
+    # 1) Stat para obter folderid
+    js_stat = _pcloud_request("stat", params={"path": remote_path})
+    md = js_stat.get("metadata") or {}
+    folderid = md.get("folderid")
+    if not folderid:
+        raise RuntimeError(f"Pasta não existe em pCloud: {remote_path}")
+
+    # 2) Garante link público e obtém o código
+    code = ensure_folder_published(folderid)
+
+    # 3) Gera o ZIP público
+    js_zip = _pcloud_request("getpubziplink", params={"code": code})
+    hosts    = js_zip.get("hosts")
+    zip_path = js_zip.get("path")
     if not hosts or not zip_path:
-        raise RuntimeError("getpubziplink retornou dados inválidos.")
+        raise RuntimeError("Resposta inválida de getpubziplink")
+
     return f"https://{hosts[0]}{zip_path}"
+
+# ================= FASTAPI ENDPOINT =================
 
 @app.get("/api/download_zip")
 async def api_download_zip(request: Request):
+    # 1) Autenticação
     sess = getattr(request.state, "session", None) or await get_session_from_request(request)
     if not sess:
         raise HTTPException(401, "Não autenticado.")
+
     colaborador_norm = (sess.get("colaborador_norm") or "").strip()
-    mes_norm = (sess.get("mes_norm") or "").strip()
+    mes_norm         = (sess.get("mes_norm") or "").strip()
+
     if not colaborador_norm:
-        raise HTTPException(400, "Sessão inválida (colaborador_norm).")
+        raise HTTPException(400, "Sessão inválida (colaborador_norm ausente).")
+
+    # 2) Monta caminho no pCloud
     remote_path = colaborador_norm + (f"/{mes_norm}" if mes_norm else "")
+
+    # 3) Tenta gerar URL
     try:
         zip_url = get_zip_url_for_subpath(remote_path)
     except Exception as exc:
         raise HTTPException(500, f"Erro ao gerar ZIP no pCloud: {exc}")
+
+    # 4) Redireciona para o ZIP
     return RedirectResponse(zip_url, status_code=302)
+
+
 
 # ===================== WEBSOCKET: PUSH runs/status/log =====================
 
@@ -3064,3 +3157,4 @@ async def scheduler_y_to_arq():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("queue_client_front:app", host="0.0.0.0", port=8001, reload=True)
+
