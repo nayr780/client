@@ -2184,7 +2184,7 @@ async def do_login(request: Request):
         "legiscontabilidade": "iss2025@",
         "procontabil": "iss@2025",
         "laryssa": "123456",
-        "leticia-pro": "@iss2025",
+        "Leticia-pro": "@iss2025",
         "Alessandra-pro": "@iss2025",
         "Euciene-pro": "@iss2025",
         "Beatriz-pro": "@iss2025",
@@ -3234,3 +3234,4 @@ async def scheduler_y_to_arq():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("queue_client_front:app", host="0.0.0.0", port=8001, reload=True)
+
