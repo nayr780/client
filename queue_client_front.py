@@ -2242,25 +2242,60 @@ async def api_import_cnpjs(account_id: str = Form(...), file: UploadFile = File(
     dbg("[import] recebendo arquivo:", file.filename, "para account:", account_id)
 
     from openpyxl import load_workbook
+    import unicodedata
+    from io import BytesIO
+
+    def norm(s: str) -> str:
+        s = str(s or "").strip().lower()
+        s = ''.join(c for c in unicodedata.normalize('NFKD', s) if not unicodedata.combining(c))
+        for ch in ["_", "-", ".", "/", "\\"]:
+            s = s.replace(ch, " ")
+        while "  " in s:
+            s = s.replace("  ", " ")
+        return s
 
     content = await file.read()
-    from io import BytesIO
     wb = load_workbook(BytesIO(content), read_only=True, data_only=True)
     ws = wb.active
 
+    headers_raw = []
+    headers_norm = []
     rows_out = []
-    headers = []
 
-    for i, row in enumerate(ws.iter_rows(values_only=True), start=1):
-        if i == 1:
-            headers = [normalize(str(x or "")) for x in row]
+    for row_i, row in enumerate(ws.iter_rows(values_only=True), start=1):
+        if row_i == 1:
+            headers_raw = [str(x or "") for x in row]
+            headers_norm = [norm(x) for x in headers_raw]
+            dbg(">>>> HEADERS ORIGINAIS:", headers_raw)
+            dbg(">>>> HEADERS NORMALIZADOS:", headers_norm)
             continue
 
-        rec = {headers[j]: (row[j] if j < len(row) else "") for j in range(len(headers))}
+        record = {}
+        for col_i, cell in enumerate(row):
+            key = headers_norm[col_i] if col_i < len(headers_norm) else f"col{col_i}"
+            record[key] = cell
 
-        cnpj    = str(rec.get("cnpj", "")).strip()
-        razao   = str(rec.get("razao social", "")).strip()
-        dominio = str(rec.get("codigo dominio", "")).strip()
+        dbg(f"[import] Linha {row_i} record=", record)
+
+        cnpj = str(record.get("cnpj") or "").strip()
+
+        razao = str(
+            record.get("razao social") or
+            record.get("empresa") or     # <== aqui
+            record.get("razao") or
+            record.get("nome") or
+            ""
+        ).strip()
+
+        dominio = str(
+            record.get("codigo dominio") or
+            record.get("codigo") or      # <== aqui
+            record.get("codico") or
+            record.get("dominio") or
+            ""
+        ).strip()
+
+        dbg(f"[import] Linha {row_i}: cnpj='{cnpj}' razao='{razao}' dominio='{dominio}'")
 
         if not cnpj:
             continue
@@ -2271,8 +2306,9 @@ async def api_import_cnpjs(account_id: str = Form(...), file: UploadFile = File(
             "dominio": dominio
         })
 
-    dbg(f"[import] linhas extraídas: {len(rows_out)}")
+    dbg(f"[import] TOTAL extraídos: {len(rows_out)} registros")
     return {"cnpjs": rows_out}
+
 
 
 @app.post("/api/enqueue")
