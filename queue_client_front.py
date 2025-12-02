@@ -19,8 +19,9 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
     Form,
+    APIRouter,
 )
-from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse
+from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 # ===================== DEBUG HELPERS =====================
@@ -511,7 +512,6 @@ async def startup():
     # 1) comandos
     app.state.redis_cmd = AsyncRedisWS(REDIS_WS_URL, token=REDIS_TOKEN, name="cmd")
     await app.state.redis_cmd.connect()
-
 
     # 3) scheduler (isolado)
     app.state.redis_scheduler = AsyncRedisWS(REDIS_WS_URL, token=REDIS_TOKEN, name="sched")
@@ -2157,6 +2157,7 @@ PAGE_CLIENT = """<!doctype html>
 </html>
 """
 
+
 # ===================== ROTAS (REST) =====================
 
 @app.get("/")
@@ -2184,11 +2185,11 @@ async def do_login(request: Request):
         "legiscontabilidade": "iss2025@",
         "procontabil": "iss@2025",
         "laryssa": "123456",
-        "Leticia-pro": "@iss2025",
-        "Alessandra-pro": "@iss2025",
-        "Euciene-pro": "@iss2025",
-        "Beatriz-pro": "@iss2025",
-        "Luan-pro": "@iss2025",
+        "leticiapro": "@iss2025",
+        "alessandrapro": "@iss2025",
+        "eucienepro": "@iss2025",
+        "beatrizpro": "@iss2025",
+        "luanpro": "@iss2025",
     }
     if colaborador not in validUsers or validUsers[colaborador] != senha:
         dbg("[login] inválido para", colaborador)
@@ -2308,8 +2309,6 @@ async def api_import_cnpjs(account_id: str = Form(...), file: UploadFile = File(
 
     dbg(f"[import] TOTAL extraídos: {len(rows_out)} registros")
     return {"cnpjs": rows_out}
-
-
 
 @app.post("/api/enqueue")
 async def api_enqueue(request: Request, payload: Dict[str, Any]):
@@ -2841,138 +2840,103 @@ async def api_stop_all(request: Request):
     dbg(f"[stop_all] tenant={tenant} prequeue_removed={prequeue_removed}")
     return {"status": "ok","stopped_jobs": 0,"prequeue_removed": prequeue_removed,"ids": [],"arq_enabled": ARQ_ENABLED}
 
-# ================= PCLOUD (ZIP PÚBLICO 100% FUNCIONAL) =================
+# ================= ZIP LOCAL (substitui PCLOUD; mesmo método do mini-sistema) =================
+import zipfile, tempfile
 
-import os
-import requests
-from typing import Iterator, Optional
-from fastapi import HTTPException
-from fastapi.responses import StreamingResponse
+# onde ficam as pastas dos colaboradores
+BASE_DIR = os.path.abspath(os.getenv("BASE_DIR", "./saidas"))
+router = APIRouter()
 
-# ===================== PCLOUD (opcional p/ ZIP) =====================
-
-PCLOUD_API = "https://api.pcloud.com"
-# use variável de ambiente em vez de token hard-coded
-PCLOUD_TOKEN = "MuRLgkZbz3P7ZeaIUlazWc9F7GAuXnBCeK4WPre7y"
-PCLOUD_ROOT = "/issbot"
-# tamanho do chunk ao fazer proxy do conteúdo
-PCLOUD_STREAM_CHUNK = 8192
-PCLOUD_REQUEST_TIMEOUT = (10, 120)  # (connect, read) seconds
-
-def _pcloud_request(method: str, endpoint: str, *, params=None, data=None, files=None) -> dict:
-    url = f"{PCLOUD_API}/{endpoint}"
-    p = dict(params or {})
-    p.setdefault("auth", PCLOUD_TOKEN)
-    try:
-        r = requests.request(method, url, params=p, data=data, files=files, timeout=60)
-        r.raise_for_status()
-    except requests.HTTPError as he:
-        # re-raise com descrição para debugging / logs
-        raise RuntimeError(f"{he} - {r.status_code if 'r' in locals() and r is not None else ''}")
-    except Exception as e:
-        raise RuntimeError(f"Erro na requisição pCloud ({endpoint}): {e}")
-    try:
-        js = r.json()
-    except ValueError:
-        raise RuntimeError(f"Resposta inválida do pCloud para {endpoint}")
-    if js.get("result") is not None and js.get("result") != 0:
-        # API pCloud normalmente usa campo 'result' para indicar sucesso (0)
-        raise RuntimeError(js.get("error", f"Erro na API pCloud ({endpoint})"))
-    return js
-
-def get_zip_url_for_subpath(remote_subpath: str) -> str:
+def _validate_and_resolve(subpath: str) -> str:
     """
-    Retorna a URL pública (temporária) do ZIP para a pasta remota no pCloud.
+    Normaliza subpath, resolve absoluto e valida que está dentro de BASE_DIR.
     """
-    remote_subpath = (remote_subpath or "").strip("/")
-    remote_path = f"{PCLOUD_ROOT}/{remote_subpath}"
-    # 1) tenta obter o public link / code da pasta
-    js_link = _pcloud_request("get", "getfolderpublink", params={"path": remote_path})
-    # o campo pode se chamar 'code' ou 'linkid' dependendo da resposta
-    code = (js_link.get("code") or js_link.get("linkid") or (js_link.get("metadata") or {}).get("code"))
-    if not code:
-        raise RuntimeError(f"Pasta não encontrada no pCloud: {remote_path}")
-    # 2) solicita o link do ZIP público (retorna hosts + path)
-    js_zip = _pcloud_request("get", "getpubziplink", params={"code": code})
-    hosts, zip_path = js_zip.get("hosts"), js_zip.get("path")
-    if not hosts or not zip_path:
-        raise RuntimeError("getpubziplink retornou dados inválidos.")
-    # monta URL final
-    return f"https://{hosts[0]}{zip_path}"
+    if not subpath:
+        raise HTTPException(400, "Subpath vazio")
+    requested = os.path.abspath(os.path.join(BASE_DIR, subpath))
+    if not (requested == BASE_DIR or requested.startswith(BASE_DIR + os.sep)):
+        dbg("download: tentativa de acesso fora de BASE_DIR:", requested)
+        raise HTTPException(404, "Pasta não encontrada")
+    if not os.path.isdir(requested):
+        dbg("download: caminho não é pasta:", requested)
+        raise HTTPException(404, "Pasta não encontrada")
+    return requested
 
-def _iter_stream_response(resp: requests.Response, chunk_size: int = PCLOUD_STREAM_CHUNK) -> Iterator[bytes]:
+def _create_zip_to_tempfile(folder: str) -> str:
+    """
+    Cria um ZIP (ZIP_DEFLATED) de `folder` em um arquivo temporário.
+    Retorna o caminho do arquivo temporário (fechado).
+    """
+    fd, tmp_path = tempfile.mkstemp(suffix=".zip", prefix="isszip_")
+    os.close(fd)
     try:
-        for chunk in resp.iter_content(chunk_size=chunk_size):
-            if chunk:
+        with zipfile.ZipFile(tmp_path, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for root, _, files in os.walk(folder):
+                for fn in files:
+                    full = os.path.join(root, fn)
+                    rel = os.path.relpath(full, folder)
+                    zf.write(full, arcname=rel)
+                    dbg(f"[zip] adicionando: {rel}")
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        raise
+    return tmp_path
+
+def _stream_file_chunks(path: str, chunk_size: int = 64 * 1024):
+    """
+    Iterador que lê o arquivo em pedaços e ao final remove o arquivo temporário.
+    """
+    try:
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
                 yield chunk
     finally:
         try:
-            resp.close()
-        except Exception:
-            pass
+            os.remove(path)
+            dbg("[zip] arquivo temporário removido:", path)
+        except Exception as e:
+            dbg("[zip] falha ao remover tmpfile:", path, repr(e))
 
-def stream_zip_from_pcloud(remote_subpath: str, filename: Optional[str] = None) -> StreamingResponse:
-    """
-    Gera um StreamingResponse que proxy-a o ZIP vindo do pCloud para o cliente.
-    """
-    zip_url = get_zip_url_for_subpath(remote_subpath)
-    try:
-        # Faz GET direto no zip_url (servidor fará a requisição, mesmo IP que gerou o link)
-        resp = requests.get(zip_url, stream=True, timeout=PCLOUD_REQUEST_TIMEOUT)
-        resp.raise_for_status()
-    except requests.HTTPError as he:
-        # repassa erro mais legível
-        status = getattr(he.response, "status_code", None) if isinstance(he, requests.HTTPError) else None
-        raise HTTPException(502, f"Erro ao baixar ZIP do pCloud (status={status}): {he}")
-    except Exception as e:
-        raise HTTPException(502, f"Erro ao acessar URL do pCloud: {e}")
-
-    # tenta extrair filename do header Content-Disposition do pCloud, se não houver, monta um padrão
-    if not filename:
-        cd = resp.headers.get("content-disposition", "")
-        fname = None
-        if "filename=" in cd:
-            # exemplo: attachment; filename="meuarquivo.zip"
-            try:
-                fname = cd.split("filename=")[1].strip().strip('"').split(";")[0]
-            except Exception:
-                fname = None
-        if not fname:
-            # fallback: transforma remote_subpath em nome seguro
-            sanitized = (remote_subpath or "download").strip("/").replace("/", "_") or "download"
-            fname = f"{sanitized}.zip"
-        filename = fname
-
-    headers = {}
-    # repassa content-length se pCloud informou (opcional)
-    if resp.headers.get("content-length"):
-        headers["Content-Length"] = resp.headers.get("content-length")
-    headers["Content-Disposition"] = f'attachment; filename="{filename}"'
-    # content-type: application/zip
-    return StreamingResponse(_iter_stream_response(resp), media_type="application/zip", headers=headers)
-
-# ===================== Endpoint atualizado (FastAPI) =====================
-
-@app.get("/api/download_zip")
+@router.get("/api/download_zip")
 async def api_download_zip(request: Request):
+    """
+    Usa a sessão para obter 'colaborador_norm' e empacota a pasta correspondente
+    dentro de BASE_DIR num ZIP, streamando o resultado (igual ao seu mini Flask).
+    """
     sess = getattr(request.state, "session", None) or await get_session_from_request(request)
     if not sess:
-        raise HTTPException(401, "Não autenticado.")
-    colaborador_norm = (sess.get("colaborador_norm") or "").strip()
-    mes_norm = (sess.get("mes_norm") or "").strip()
-    if not colaborador_norm:
-        raise HTTPException(400, "Sessão inválida (colaborador_norm).")
-    remote_path = colaborador_norm + (f"/{mes_norm}" if mes_norm else "")
+        dbg("[api_download_zip] não autenticado")
+        raise HTTPException(401, "Não autenticado")
+
+    subpath = (sess.get("colaborador_norm") or "").strip()
+    if not subpath:
+        dbg("[api_download_zip] sessão sem colaborador_norm")
+        raise HTTPException(400, "Sessão inválida")
+
+    folder = _validate_and_resolve(subpath)
+    zip_basename = os.path.basename(folder.rstrip(os.sep)) or "download"
+    dbg(f"[api_download_zip] gerando ZIP para: {folder} -> {zip_basename}.zip")
 
     try:
-        # ao invés de redirecionar, fazemos proxy/stream do ZIP
-        return stream_zip_from_pcloud(remote_path)
+        tmp_zip = _create_zip_to_tempfile(folder)
     except HTTPException:
         raise
     except Exception as exc:
-        # logue exc em seu logger real
-        raise HTTPException(500, f"Erro ao gerar/streamar ZIP no pCloud: {exc}")
+        dbg("[api_download_zip] erro criando zip:", repr(exc))
+        raise HTTPException(500, f"Erro ao gerar ZIP: {exc}")
 
+    headers = {"Content-Disposition": f'attachment; filename="{zip_basename}.zip"'}
+    return StreamingResponse(_stream_file_chunks(tmp_zip), media_type="application/zip", headers=headers)
+
+# registra o router
+app.include_router(router)
+# ==========================================================================
 
 # ===================== WEBSOCKET: PUSH runs/status/log =====================
 
@@ -3000,12 +2964,11 @@ class LiveHub:
         for c in list(conns):
             try:
                 await c.send_json(payload)
-            except Exception as e:
+            except Exception:
                 conns.discard(c)
         dbg("[livehub] broadcast", payload.get("type"), "to", len(conns), "client(s)")
 
     async def _run_subscriber_loop(self, tenant: str):
-        # Cada tenant tem seu próprio pubsub / conexão WS com o Redis
         pubsub = AsyncRedisPubSubWS(REDIS_WS_URL, token=REDIS_TOKEN)
         await pubsub.connect()
 
@@ -3082,7 +3045,6 @@ class LiveHub:
                     await asyncio.sleep(0.25)
         finally:
             await pubsub.aclose()
-
 
     async def _push_status_async(self, tenant: str, runs: Dict[str, Any]):
         try:
@@ -3234,4 +3196,3 @@ async def scheduler_y_to_arq():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("queue_client_front:app", host="0.0.0.0", port=8001, reload=True)
-
