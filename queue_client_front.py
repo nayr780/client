@@ -2450,10 +2450,43 @@ async def build_status_index(relevant_cnpjs: Dict[str, Dict[str, Any]], allowed_
     job_events: Dict[str, Dict[str, Any]] = {}
     etapas = ["escrituracao", "notas", "dam", "certidao"]
 
-    keys = list(relevant_cnpjs.keys())
+    # --- normaliza entrada inicial (pode vir vazia) ---
+    keys = list(relevant_cnpjs.keys())  # existing keys coming from runs
+
+    # ---- NOVO: varredura da pré-fila para acrescentar CNPJs que só estão em waiting ----
+    try:
+        colabs = await rd.smembers(PREQUEUE_COLABS_SET)
+    except Exception:
+        colabs = []
+
+    for colab in colabs:
+        y_key = f"{PREQUEUE_NS}:colab:{colab}"
+        try:
+            raw_items = await rd.lrange(y_key, 0, -1)
+        except Exception:
+            raw_items = []
+        for raw in raw_items:
+            try:
+                env = json.loads(raw)
+            except Exception:
+                continue
+            func = env.get("func") or ""
+            args = env.get("args") or []
+            meta = extract_meta(func, args, {})
+            cd = cnpj_digits(meta.get("cnpj", ""))
+            mes = meta.get("mes", "") or ""
+            # cria a chave do mesmo jeito que o resto do sistema usa
+            key = f"{cd}:{mes}" if mes else cd
+            if cd and key not in relevant_cnpjs:
+                # adiciona ao mapa de relevantes para que events seja criado
+                relevant_cnpjs[key] = {"cnpj": cd, "mes": mes}
+                keys.append(key)
+    # ---- fim da inclusão da pré-fila ----
+
     if not keys:
         return {"status_per_cnpj": {}, "job_events": {}, "kpis": {"running": 0, "queue": 0, "total_cnpjs": 0}}
 
+    # inicializa estrutura events com todas as chaves (incluindo as vindas da pré-fila)
     events: Dict[str, Dict[str, List[Dict[str, Any]]]] = {k: {e: [] for e in etapas} for k in keys}
 
     running_count = 0
@@ -2478,12 +2511,7 @@ async def build_status_index(relevant_cnpjs: Dict[str, Dict[str, Any]], allowed_
         if key1 in events:
             events[key1].setdefault(etapa, []).append({"status": st_str, "job_id": job_id})
 
-    # 1) Pré-fila (waiting)
-    try:
-        colabs = await rd.smembers(PREQUEUE_COLABS_SET)
-    except Exception:
-        colabs = []
-
+    # 1) Pré-fila (waiting) — agora, como já incluímos chaves, os append funcionarão
     for colab in colabs:
         y_key = f"{PREQUEUE_NS}:colab:{colab}"
         try:
@@ -2572,6 +2600,7 @@ async def build_status_index(relevant_cnpjs: Dict[str, Dict[str, Any]], allowed_
         status_per_cnpj[key] = s
 
     return {"status_per_cnpj": status_per_cnpj, "job_events": job_events, "kpis": {"running": running_count, "queue": queue_count, "total_cnpjs": len(keys)}}
+
 
 @app.get("/api/status")
 async def api_status(request: Request):
@@ -2840,103 +2869,8 @@ async def api_stop_all(request: Request):
     dbg(f"[stop_all] tenant={tenant} prequeue_removed={prequeue_removed}")
     return {"status": "ok","stopped_jobs": 0,"prequeue_removed": prequeue_removed,"ids": [],"arq_enabled": ARQ_ENABLED}
 
-# ================= ZIP LOCAL (substitui PCLOUD; mesmo método do mini-sistema) =================
-import zipfile, tempfile
-
-# onde ficam as pastas dos colaboradores
-BASE_DIR = os.path.abspath(os.getenv("BASE_DIR", "./saidas"))
-router = APIRouter()
-
-def _validate_and_resolve(subpath: str) -> str:
-    """
-    Normaliza subpath, resolve absoluto e valida que está dentro de BASE_DIR.
-    """
-    if not subpath:
-        raise HTTPException(400, "Subpath vazio")
-    requested = os.path.abspath(os.path.join(BASE_DIR, subpath))
-    if not (requested == BASE_DIR or requested.startswith(BASE_DIR + os.sep)):
-        dbg("download: tentativa de acesso fora de BASE_DIR:", requested)
-        raise HTTPException(404, "Pasta não encontrada")
-    if not os.path.isdir(requested):
-        dbg("download: caminho não é pasta:", requested)
-        raise HTTPException(404, "Pasta não encontrada")
-    return requested
-
-def _create_zip_to_tempfile(folder: str) -> str:
-    """
-    Cria um ZIP (ZIP_DEFLATED) de `folder` em um arquivo temporário.
-    Retorna o caminho do arquivo temporário (fechado).
-    """
-    fd, tmp_path = tempfile.mkstemp(suffix=".zip", prefix="isszip_")
-    os.close(fd)
-    try:
-        with zipfile.ZipFile(tmp_path, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for root, _, files in os.walk(folder):
-                for fn in files:
-                    full = os.path.join(root, fn)
-                    rel = os.path.relpath(full, folder)
-                    zf.write(full, arcname=rel)
-                    dbg(f"[zip] adicionando: {rel}")
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
-        raise
-    return tmp_path
-
-def _stream_file_chunks(path: str, chunk_size: int = 64 * 1024):
-    """
-    Iterador que lê o arquivo em pedaços e ao final remove o arquivo temporário.
-    """
-    try:
-        with open(path, "rb") as f:
-            while True:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    break
-                yield chunk
-    finally:
-        try:
-            os.remove(path)
-            dbg("[zip] arquivo temporário removido:", path)
-        except Exception as e:
-            dbg("[zip] falha ao remover tmpfile:", path, repr(e))
-
-@router.get("/api/download_zip")
-async def api_download_zip(request: Request):
-    """
-    Usa a sessão para obter 'colaborador_norm' e empacota a pasta correspondente
-    dentro de BASE_DIR num ZIP, streamando o resultado (igual ao seu mini Flask).
-    """
-    sess = getattr(request.state, "session", None) or await get_session_from_request(request)
-    if not sess:
-        dbg("[api_download_zip] não autenticado")
-        raise HTTPException(401, "Não autenticado")
-
-    subpath = (sess.get("colaborador_norm") or "").strip()
-    if not subpath:
-        dbg("[api_download_zip] sessão sem colaborador_norm")
-        raise HTTPException(400, "Sessão inválida")
-
-    folder = _validate_and_resolve(subpath)
-    zip_basename = os.path.basename(folder.rstrip(os.sep)) or "download"
-    dbg(f"[api_download_zip] gerando ZIP para: {folder} -> {zip_basename}.zip")
-
-    try:
-        tmp_zip = _create_zip_to_tempfile(folder)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        dbg("[api_download_zip] erro criando zip:", repr(exc))
-        raise HTTPException(500, f"Erro ao gerar ZIP: {exc}")
-
-    headers = {"Content-Disposition": f'attachment; filename="{zip_basename}.zip"'}
-    return StreamingResponse(_stream_file_chunks(tmp_zip), media_type="application/zip", headers=headers)
-
-# registra o router
-app.include_router(router)
-# ==========================================================================
+from pcloud_download import make_pcloud_router
+app.include_router(make_pcloud_router(get_session_from_request))
 
 # ===================== WEBSOCKET: PUSH runs/status/log =====================
 
