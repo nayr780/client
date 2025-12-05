@@ -3498,53 +3498,83 @@ async def ws_bridge(websocket: WebSocket):
 
 # ===================== SCHEDULER INTERNO — Y ➜ ARQ =====================
 
-MAX_QUEUE = 10  # limite da fila
+MAX_QUEUE = 10  # limite máximo de jobs na arq:queue
 
 async def scheduler_y_to_arq():
     print("[scheduler] iniciado!")
     rd = app.state.redis_scheduler
 
+    # armazenar ordem dos colaboradores
+    rr_index = 0
+
     while True:
         try:
-            # 1) se existe job rodando → não manda nada
-            running = await rd.scan("arq:in-progress:*")
-            if running[1]:
-                await asyncio.sleep(1)
+            # 1) Se existe job em execução → não enviar nada
+            running_keys = await rd.scan("arq:in-progress:*")
+            if running_keys[1]:
+                await asyncio.sleep(0.5)
                 continue
 
-            # 2) se fila cheia → não manda nada
+            # 2) Se a fila estiver cheia → esperar
             queue_len = await rd.zcard("arq:queue")
             if queue_len >= MAX_QUEUE:
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
                 continue
 
-            # 3) pega 1 job da pré-fila
-            colabs = await rd.smembers(PREQUEUE_COLABS_SET)
-            for colab in colabs:
-                y_key = f"{PREQUEUE_NS}:colab:{colab}"
+            # 3) Listar colaboradores que têm pré-fila
+            colabs = list(await rd.smembers(PREQUEUE_COLABS_SET))
 
-                raw = await rd.lpop(y_key)
-                if not raw:
-                    continue
+            if not colabs:
+                await asyncio.sleep(0.5)
+                continue
 
-                env = json.loads(raw)
-                func = env["func"]
-                args_list = env["args"]
-                job_id = env["enqueue_kwargs"]["_job_id"]
+            # ---- ROUND ROBIN DE COLABORADORES ----
+            colabs.sort()  # ordem estável
+            colab = colabs[rr_index % len(colabs)]
+            rr_index += 1
 
-                now_ms = int(time.time() * 1000)
-                jobdef = {"t": 1, "f": func, "a": tuple(args_list), "k": {}, "et": now_ms}
+            y_key = f"{PREQUEUE_NS}:colab:{colab}"
 
-                await rd.set(f"arq:job:{job_id}", pickle.dumps(jobdef))
-                await rd.zadd("arq:queue", now_ms, job_id)
+            # 4) Pega **UM** job da pré-fila desse colaborador
+            raw = await rd.lpop(y_key)
+            if not raw:
+                # se estava vazio → remover do set
+                await rd.srem(PREQUEUE_COLABS_SET, colab)
+                continue
 
-                print("[scheduler] liberei 1 job da pré-fila:", job_id)
-                break
+            env = json.loads(raw)
+            func = env.get("func")
+            args_list = env.get("args") or []
+            job_id = env.get("enqueue_kwargs", {}).get("_job_id")
+
+            if not func or not job_id:
+                continue
+
+            # 5) Criar estrutura do job ARQ
+            now_ms = int(time.time() * 1000)
+            jobdef = {
+                "t": 1,
+                "f": func,
+                "a": tuple(args_list),
+                "k": {},
+                "et": now_ms
+            }
+
+            await rd.set(f"arq:job:{job_id}", pickle.dumps(jobdef))
+            await rd.zadd("arq:queue", now_ms, job_id)
+
+            print(f"[scheduler][RR] Liberado job {job_id} do colaborador {colab}")
+
+            # Se a lista ficou vazia → remover do set
+            list_len = await rd.llen(y_key)
+            if list_len == 0:
+                await rd.srem(PREQUEUE_COLABS_SET, colab)
 
         except Exception as e:
             print("[scheduler] erro:", repr(e))
 
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(0.20)
+
 
 
 
