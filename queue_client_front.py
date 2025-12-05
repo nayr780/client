@@ -19,12 +19,13 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
     Form,
-    APIRouter,
 )
 from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# ===================== DEBUG HELPERS =====================
+import websockets
+
+from pcloud_store import read_db, write_db  # <<< NOVO: config global no pCloud
 
 DEBUG = os.getenv("DEBUG_QUEUE_FRONT", "1").lower() in ("1", "true", "yes")
 
@@ -36,9 +37,6 @@ def dbg(*args):
 
 
 # ===================== CLIENTE WS RESP (inline) =====================
-
-import websockets
-
 
 class RedisRESPError(Exception):
     pass
@@ -174,7 +172,6 @@ class AsyncRedisWS:
                 await self.aclose()
                 return None
 
-    # ===== Comandos =====
     async def ping(self) -> bool:
         r = await self.execute("PING")
         return (r == "PONG") or (r is not None)
@@ -299,10 +296,6 @@ class AsyncRedisWS:
 
 
 class AsyncRedisPubSubWS:
-    """
-    Conexão dedicada a Pub/Sub via RESP-over-WS.
-    """
-
     def __init__(self, url: str, token: str = ""):
         self.url = f"{url}?token={token}" if token else url
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
@@ -351,12 +344,6 @@ class AsyncRedisPubSubWS:
         await self._send("PSUBSCRIBE", *patterns)
 
     async def read_message(self) -> Optional[Dict[str, Any]]:
-        """
-        Retorna:
-          {"type":"message","channel": "...", "payload": "..."}
-          {"type":"pmessage","pattern":"...", "channel": "...", "payload": "..."}
-          {"type":"subscribe"|...}
-        """
         if not self._ws or getattr(self._ws, "closed", False):
             await self.connect()
         data = await self._ws.recv()
@@ -403,10 +390,10 @@ PREQUEUE_NS = os.getenv("PREQUEUE_NS", f"{REDIS_LOG_NS}:y")
 PREQUEUE_COLABS_SET = f"{PREQUEUE_NS}:colabs"
 
 FRONT_LAST_RUN_KEY = f"{REDIS_LOG_NS}:front:last_run_ts"
-ARQ_ENABLED = False  # informativo
+ARQ_ENABLED = False
 
 SESSION_COOKIE_NAME = os.getenv("FRONT_SESSION_COOKIE", "iss_front_session")
-SESSION_TTL = int(os.getenv("FRONT_SESSION_TTL", "86400"))  # 1 dia
+SESSION_TTL = int(os.getenv("FRONT_SESSION_TTL", "86400"))
 
 # ===================== HELPERS =====================
 
@@ -441,6 +428,50 @@ def slugify(value: str) -> str:
 
 def task_logs_key(job_id: str) -> str:
     return f"{REDIS_LOG_NS}:task:{job_id}:logs"
+
+
+# ============ HELPERS DE CONFIG NO PCLOUD (TENANT) ============
+
+def _ensure_tenant_cfg(db: Dict[str, Any], tenant: str) -> Dict[str, Any]:
+    """
+    Garante estrutura:
+    {
+      "version": ...,
+      "data": {
+         "tenants": {
+            "<tenant>": {
+                "accounts": { id -> {...} },
+                "cnpjs":    { id -> {...} },
+            }
+         }
+      }
+    }
+    """
+    data = db.setdefault("data", {})
+    tenants = data.setdefault("tenants", {})
+    cfg = tenants.get(tenant)
+    if not isinstance(cfg, dict):
+        cfg = {"accounts": {}, "cnpjs": {}}
+    cfg.setdefault("accounts", {})
+    cfg.setdefault("cnpjs", {})
+    tenants[tenant] = cfg
+    return cfg
+
+
+def load_tenant_cfg(tenant: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Retorna (db_completo, cfg_do_tenant)
+    """
+    db = read_db()
+    cfg = _ensure_tenant_cfg(db, tenant)
+    return db, cfg
+
+
+def save_tenant_cfg(db: Dict[str, Any]):
+    """
+    Persiste DB completo no pCloud.
+    """
+    write_db(db)
 
 
 def extract_meta(function: str, args: List[Any], kwargs: Dict[str, Any]) -> Dict[str, Any]:
@@ -546,8 +577,6 @@ def merge_status(current: str, new: str) -> str:
     return new if STATUS_PRIORITY.get(new, 0) >= STATUS_PRIORITY.get(current, 0) else current
 
 
-# ===================== APP =====================
-
 app = FastAPI(title="ISS Queue Front (Cliente) — WS-only (Render)")
 
 app.add_middleware(
@@ -559,7 +588,6 @@ app.add_middleware(
 
 
 def rds() -> AsyncRedisWS:
-    # cliente de comandos (REST, leituras, gravações)
     return getattr(app.state, "redis_cmd", None)
 
 
@@ -580,8 +608,6 @@ async def get_session_from_request(request: Request) -> Optional[Dict[str, Any]]
         return None
 
 
-# ===================== AUTH MIDDLEWARE =====================
-
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     path = request.url.path
@@ -599,15 +625,11 @@ async def auth_middleware(request: Request, call_next):
     return await call_next(request)
 
 
-# ===================== STARTUP / SHUTDOWN =====================
-
 @app.on_event("startup")
 async def startup():
-    # 1) comandos
     app.state.redis_cmd = AsyncRedisWS(REDIS_WS_URL, token=REDIS_TOKEN, name="cmd")
     await app.state.redis_cmd.connect()
 
-    # 2) scheduler (isolado)
     app.state.redis_scheduler = AsyncRedisWS(REDIS_WS_URL, token=REDIS_TOKEN, name="sched")
     await app.state.redis_scheduler.connect()
 
@@ -628,8 +650,6 @@ async def shutdown():
     print("Shutdown concluído (WS fechados).")
 
 
-# ===================== RUNS PERSISTÊNCIA =====================
-
 async def load_runs(rd: AsyncRedisWS, tenant: str) -> Dict[str, Dict[str, Any]]:
     if not tenant:
         return {}
@@ -648,54 +668,7 @@ async def save_runs(rd: AsyncRedisWS, tenant: str, data: Dict[str, Dict[str, Any
     await rd.set(runs_key_for(tenant), json.dumps(data))
 
 
-# ===================== HTML LOGIN =====================
-
-PAGE_LOGIN = """<!doctype html>
-<html lang="pt-br">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Prumo Sistemas — Login ISS Front (Cliente)</title>
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"/>
-  <style>body{background:#f8f9fa;min-height:100vh;display:flex;align-items:center;justify-content:center;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}.login-card{max-width:420px;width:100%;border-radius:.75rem;box-shadow:0 .5rem 1rem rgba(0,0,0,.08)}</style>
-</head>
-<body>
-  <div class="card login-card">
-    <div class="card-body p-4">
-      <h1 class="h5 mb-3 text-center">Prumo Sistemas — ISS Front</h1>
-      <p class="text-muted small text-center mb-4">Informe o nome do colaborador e a senha padrão para acessar o painel.</p>
-      <form method="post" action="/login" autocomplete="off">
-        <div class="mb-3">
-          <label class="form-label small text-muted">Colaborador</label>
-          <input class="form-control" name="colaborador" placeholder="Ex.: João da Silva" required>
-        </div>
-        <div class="mb-3">
-          <label class="form-label small text-muted">Senha</label>
-          <input type="password" class="form-control" name="senha" placeholder="123456" required>
-        </div>
-        <div class="d-grid"><button class="btn btn-primary" type="submit">Entrar</button></div>
-        <div id="erroLogin" class="text-danger small mt-3 text-center" style="display:none;">Usuário ou senha incorretos.</div>
-      </form>
-    </div>
-  </div>
-<script>
-  document.querySelector("form").addEventListener("submit", async function (e) {
-    e.preventDefault();
-    const form = e.target;
-    const formData = new FormData(form);
-    const erroEl = document.getElementById("erroLogin");
-    erroEl.style.display = "none";
-    const resp = await fetch("/login", { method: "POST", body: formData });
-    if (resp.status === 200 || resp.status === 303) { window.location.href = "/"; return; }
-    if (resp.status === 401) { erroEl.style.display = "block"; }
-  });
-</script>
-</body>
-</html>
-"""
-
-
-# ===================== HTML LOGIN =====================
+# ===================== PÁGINAS HTML (login + client) =====================
 
 PAGE_LOGIN = """<!doctype html>
 <html lang="pt-br">
@@ -743,8 +716,6 @@ PAGE_LOGIN = """<!doctype html>
 </body>
 </html>
 """
-
-# ===================== HTML CLIENT =====================
 
 PAGE_CLIENT = """<!doctype html>
 <html lang="pt-br">
@@ -1258,15 +1229,12 @@ PAGE_CLIENT = """<!doctype html>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script>
   document.addEventListener('DOMContentLoaded', () => {
-    // ---------- Delegated Tooltip (UMA instância somente) ----------
-    // Usa delegação para evitar criar muitas instâncias e travar o navegador.
     try {
       new bootstrap.Tooltip(document.body, {
         selector: '[data-bs-toggle="tooltip"]',
         trigger: 'hover focus'
       });
     } catch (e) {
-      // se bootstrap não estiver disponível por algum motivo, ignora
       console.warn('Tooltip delegation init falhou:', e);
     }
 
@@ -1316,55 +1284,15 @@ PAGE_CLIENT = """<!doctype html>
     const enfileirarResult = document.getElementById('enfileirar-result');
     const btnEnfileirar = document.getElementById('btn-enfileirar');
 
-    let ACCS = {};   // id -> account (apenas localStorage)
-    let CNPJS = {};  // id -> cnpj   (apenas localStorage)
-    let FULL_LOG_TEXT = ''; // usado no filtro
+    // Agora estes objetos vêm SEMPRE do backend (pCloud), não mais do localStorage
+    let ACCS = {};   // id -> account (sem senha)
+    let CNPJS = {};  // id -> cnpj
+    let FULL_LOG_TEXT = '';
 
-    let STORAGE_KEY_ACCOUNTS = '';
-    let STORAGE_KEY_CNPJS = '';
-
-    // LOG refresh periódico dentro do modal
     let LOG_REFRESH_INTERVAL = null;
-
-    // NOVO: WebSocket de status / logs em tempo real
     let STATUS_WS = null;
     let WS_RETRY_MS = 1000;
     let CURRENT_RUNS = {};
-
-    function initStorageKeys(colabNorm) {
-      const base = 'iss_front_' + (colabNorm || 'default') + '_';
-      STORAGE_KEY_ACCOUNTS = base + 'accounts';
-      STORAGE_KEY_CNPJS = base + 'cnpjs';
-    }
-
-    function loadFromLocal() {
-      if (!STORAGE_KEY_ACCOUNTS) return;
-      try {
-        const rawAcc = localStorage.getItem(STORAGE_KEY_ACCOUNTS);
-        ACCS = rawAcc ? JSON.parse(rawAcc) : {};
-      } catch {
-        ACCS = {};
-      }
-      try {
-        const rawCnp = localStorage.getItem(STORAGE_KEY_CNPJS);
-        CNPJS = rawCnp ? JSON.parse(rawCnp) : {};
-      } catch {
-        CNPJS = {};
-      }
-    }
-
-    function saveToLocal() {
-      if (STORAGE_KEY_ACCOUNTS) {
-        localStorage.setItem(STORAGE_KEY_ACCOUNTS, JSON.stringify(ACCS));
-      }
-      if (STORAGE_KEY_CNPJS) {
-        localStorage.setItem(STORAGE_KEY_CNPJS, JSON.stringify(CNPJS));
-      }
-    }
-
-    function findLocalCnpj(cnpjDigits) {
-      return Object.values(CNPJS).find(c => c.cnpj === cnpjDigits) || null;
-    }
 
     function genId() {
       if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
@@ -1395,12 +1323,10 @@ PAGE_CLIENT = """<!doctype html>
         }
     }
 
-    // Deixa cada linha “bonita” mas SEM perder coisas como flow=escrituracao
     function formatLogLinePretty(line) {
         line = (line || "").trimEnd();
         if (!line) return "";
 
-        // Cabeçalho de job
         if (line.startsWith("=== Job ") && line.endsWith(" ===")) {
             const m = line.match(/^=== Job ([0-9a-fA-F]+) ===$/);
             const id = m ? m[1] : line;
@@ -1408,23 +1334,18 @@ PAGE_CLIENT = """<!doctype html>
             return "\\n──────── Job " + shortId + " ────────";
         }
 
-        // Tenta pegar timestamp + nível
         const m = line.match(/^(\\d{4}-\\d{2}-\\d{2}) (\\d{2}:\\d{2}:\\d{2}),\\d+\\s+\\[(\\w+)\\]\\s+(.*)$/);
         if (!m) {
-            // Linha simples (ex: "Erro de login: ...")
             if (/^Erro/i.test(line)) {
                 return "⚠️ " + line;
             }
-            // Deixa como está
             return line;
         }
 
-        const date = m[1];              // 2025-11-24
-        const time = m[2];              // 14:25:36
-        const level = m[3];             // INFO / WARNING / ERROR
-        let rest = m[4] || "";          // resto
+        const time = m[2];
+        const level = m[3];
+        let rest = m[4] || "";
 
-        // Extrai tag [STEP], [FLOW_START], [FLOW_END], [EVENT], etc
         let tag = "";
         let msg = rest;
         const tagMatch = rest.match(/^\\[(\\w+)\\]\\s*(.*)$/);
@@ -1433,7 +1354,6 @@ PAGE_CLIENT = """<!doctype html>
             msg = tagMatch[2] || "";
         }
 
-        // Deixa mensagens mais humanas, mas preservando flow= / cnpj= / etc
         let human = msg;
 
         if (tag === "FLOW_START" || tag === "FLOW_END" || tag === "EVENT") {
@@ -1447,19 +1367,16 @@ PAGE_CLIENT = """<!doctype html>
                 human = "• " + trailing;
             }
         } else if (tag === "STEP") {
-            // Exemplo:
-            // flow=escrituracao ... step=Login :: Step: Login
             let stepName = "";
             const stepMatch = msg.match(/step=([^ ]+)/i);
             if (stepMatch) {
                 stepName = stepMatch[1];
             }
             const parts = msg.split("::");
-            const trailing = (parts[parts.length - 1] || "").trim(); // "Step: Login"
+            const trailing = (parts[parts.length - 1] || "").trim();
             human = "STEP" + (stepName ? " (" + stepName + ")" : "") + " — " + trailing;
         }
 
-        // Monta prefixo com hora + nível
         let prefix = "[" + time + "] [" + level + "]";
         if (tag && !["STEP","FLOW_START","FLOW_END","EVENT"].includes(tag)) {
             prefix += " [" + tag + "]";
@@ -1467,7 +1384,6 @@ PAGE_CLIENT = """<!doctype html>
 
         let full = prefix + " " + human;
 
-        // Destaca erros visualmente
         if (level === "ERROR" || /Erro de /.test(human)) {
             full = "⚠️ " + full;
         }
@@ -1483,23 +1399,20 @@ PAGE_CLIENT = """<!doctype html>
         for (let rawLine of lines) {
             let line = rawLine;
 
-            // início do traceback
             if (!skippingTraceback && line.startsWith("Traceback (most recent call last):")) {
                 skippingTraceback = true;
                 continue;
             }
 
             if (skippingTraceback) {
-                // quando chega na linha do erro final, volta a exibir
                 if (line.startsWith("flow_core.") || line.match(/^[\\w\\.]+Error:/)) {
                     line = simplifyExceptionLine(line.trim());
                     out.push(formatLogLinePretty(line));
                     skippingTraceback = false;
                 }
-                continue; // ignora tudo dentro do traceback
+                continue;
             }
 
-            // ignora frames de stacktrace
             if (/^\\s*File ".*", line \\d+, in /.test(line)) continue;
             if (/^\\s*raise /.test(line)) continue;
             if (/^\\s*During handling of the above exception/.test(line)) continue;
@@ -1510,8 +1423,6 @@ PAGE_CLIENT = """<!doctype html>
 
         return out.join("\\n").trim();
     }
-
-    // ====================== FIM HIGIENIZAÇÃO ======================
 
     function fmtCnpj(d) {
       const c = d.padStart(14,'0');
@@ -1529,6 +1440,27 @@ PAGE_CLIENT = """<!doctype html>
         throw new Error(msg || ('HTTP ' + r.status));
       }
       return r.json();
+    }
+
+    // ======= NOVO: carrega config (contas + CNPJs) do backend (pCloud) =======
+    async function loadConfigFromBackend() {
+      try {
+        const cfg = await fetchJSON('/api/config');
+        ACCS = {};
+        (cfg.accounts || []).forEach(a => {
+          if (!a.id) return;
+          ACCS[a.id] = a;
+        });
+        CNPJS = {};
+        (cfg.cnpjs || []).forEach(c => {
+          if (!c.id) return;
+          CNPJS[c.id] = c;
+        });
+        renderAccounts();
+        renderCnpjs();
+      } catch (err) {
+        console.error('Erro ao carregar config:', err);
+      }
     }
 
     function renderAccounts() {
@@ -1552,7 +1484,7 @@ PAGE_CLIENT = """<!doctype html>
       });
       accListDiv.appendChild(list);
 
-      // atualiza selects de conta
+      // selects
       cnpjAccountSelect.innerHTML = '';
       importAccountSelect.innerHTML = '';
       Object.values(ACCS).forEach(acc => {
@@ -1574,7 +1506,6 @@ PAGE_CLIENT = """<!doctype html>
     }
 
     function renderCnpjs() {
-      // tabela de manutenção
       tbodyCnpjs.innerHTML = '';
       Object.values(CNPJS).forEach(c => {
         const tr = document.createElement('tr');
@@ -1645,7 +1576,6 @@ PAGE_CLIENT = """<!doctype html>
       if (!k || !k.kpis) return;
       kpiRunning.textContent = k.kpis.running ?? 0;
       kpiQueue.textContent = k.kpis.queue ?? 0;
-      // Total de CNPJs: usamos o que está no localStorage
       kpiTotal.textContent = Object.keys(CNPJS).length;
       kpiLastRun.textContent = k.kpis.last_run_str || '—';
     }
@@ -1680,7 +1610,6 @@ PAGE_CLIENT = """<!doctype html>
       const ic = iconByStatus[status] || 'bi-dot';
       const tt = titleByStatus[status] || status;
       const etapaPart = etapaName ? (etapaName + ': ') : '';
-      // mantém data-bs-toggle, title e delegação cuidará da instanciação
       return `<span class="status-etapa ${status}" data-bs-toggle="tooltip" title="${etapaPart}${tt}">
         <i class="bi ${ic}"></i>
       </span>`;
@@ -1698,6 +1627,10 @@ PAGE_CLIENT = """<!doctype html>
         const st = (etapasObj && etapasObj[key]) || 'pending';
         return badgeEtapa(st, labels[key]);
       }).join('');
+    }
+
+    function findLocalCnpj(cnpjDigits) {
+      return Object.values(CNPJS).find(c => c.cnpj === cnpjDigits) || null;
     }
 
     function renderStatusTable(data) {
@@ -1741,24 +1674,6 @@ PAGE_CLIENT = """<!doctype html>
           </td>`;
         tbodyStatus.appendChild(tr);
       });
-
-      // NÃO criamos tooltips individualmente aqui — usamos delegação única inicializada no DOMContentLoaded
-    }
-
-    async function loadAll() {
-      loadFromLocal();
-      renderAccounts();
-      renderCnpjs();
-      try {
-        const [kpisData, statusData] = await Promise.all([
-          fetchJSON('/api/kpis'),
-          fetchJSON('/api/status'),
-        ]);
-        applyKpis(kpisData);
-        renderStatusTable(statusData);
-      } catch (e) {
-        console.error(e);
-      }
     }
 
     async function loadStatus() {
@@ -1772,6 +1687,11 @@ PAGE_CLIENT = """<!doctype html>
       } catch (e) {
         console.error(e);
       }
+    }
+
+    async function loadAll() {
+      await loadConfigFromBackend();
+      await loadStatus();
     }
 
     // ====================== WEBSOCKET STATUS/LOGS ======================
@@ -1803,10 +1723,7 @@ PAGE_CLIENT = """<!doctype html>
           applyKpis({ kpis: msg.kpis || {} });
           renderStatusTable({ rows: msg.rows || [] });
         } else if (msg.type === 'log') {
-          // opcional: exibir log em tempo real em alguma área
-          // console.log('[WS LOG]', msg.job_id, msg.line);
-        } else if (msg.type === 'ping') {
-          // ignore
+          // poderia usar para log em tempo real, se quiser
         }
       };
 
@@ -1822,8 +1739,8 @@ PAGE_CLIENT = """<!doctype html>
       };
     }
 
-    // ========= AÇÕES DE FORMULÁRIO DE CONTA (LOCALSTORAGE) =========
-    document.getElementById('form-account').addEventListener('submit', (e) => {
+    // ========= FORM CONTAS (salva no backend /api/accounts) =========
+    document.getElementById('form-account').addEventListener('submit', async (e) => {
       e.preventDefault();
       const id = document.getElementById('acc-id').value || genId();
       const provider = document.getElementById('acc-provider').value || '1';
@@ -1832,21 +1749,21 @@ PAGE_CLIENT = """<!doctype html>
       const alias = document.getElementById('acc-alias').value.trim();
       if (!user || !password) return;
 
-      ACCS[id] = {
-        id,
-        provider,
-        user,
-        password,
-        alias,
-      };
-      saveToLocal();
-      document.getElementById('acc-id').value = '';
-      document.getElementById('acc-pass').value = '';
-      document.getElementById('acc-user').value = '';
-      document.getElementById('acc-alias').value = '';
-      renderAccounts();
-      renderCnpjs();
-      loadStatus();
+      try {
+        await fetchJSON('/api/accounts', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ id, provider, user, password, alias }),
+        });
+        document.getElementById('acc-id').value = '';
+        document.getElementById('acc-pass').value = '';
+        document.getElementById('acc-user').value = '';
+        document.getElementById('acc-alias').value = '';
+        await loadConfigFromBackend();
+        await loadStatus();
+      } catch (err) {
+        alert('Erro ao salvar conta: ' + err.message);
+      }
     });
 
     document.getElementById('acc-reset').addEventListener('click', () => {
@@ -1856,7 +1773,7 @@ PAGE_CLIENT = """<!doctype html>
       document.getElementById('acc-alias').value = '';
     });
 
-    accListDiv.addEventListener('click', (e) => {
+    accListDiv.addEventListener('click', async (e) => {
       const btn = e.target.closest('button');
       if (!btn) return;
       const editId = btn.getAttribute('data-edit');
@@ -1866,21 +1783,21 @@ PAGE_CLIENT = """<!doctype html>
         document.getElementById('acc-id').value = a.id;
         document.getElementById('acc-user').value = a.user;
         document.getElementById('acc-alias').value = a.alias || '';
+        document.getElementById('acc-pass').value = ''; // senha não é exibida
       } else if (delId) {
         if (!confirm('Remover conta? CNPJs que apontarem para ela ficarão sem conta.')) return;
-        delete ACCS[delId];
-        Object.values(CNPJS).forEach(c => {
-          if (c.account_id === delId) c.account_id = '';
-        });
-        saveToLocal();
-        renderAccounts();
-        renderCnpjs();
-        loadStatus();
+        try {
+          await fetchJSON('/api/accounts/' + delId, { method: 'DELETE' });
+          await loadConfigFromBackend();
+          await loadStatus();
+        } catch (err) {
+          alert('Erro ao remover conta: ' + err.message);
+        }
       }
     });
 
-    // === CNPJs (modal / LOCALSTORAGE) ===
-    document.getElementById('form-cnpj').addEventListener('submit', (e) => {
+    // === CNPJs (modal, salvando no backend /api/cnpjs) ===
+    document.getElementById('form-cnpj').addEventListener('submit', async (e) => {
       e.preventDefault();
       const id = document.getElementById('cnpj-id').value || genId();
       const account_id = document.getElementById('cnpj-account').value;
@@ -1889,28 +1806,34 @@ PAGE_CLIENT = """<!doctype html>
       const dominio = document.getElementById('inp-dominio').value;
       if (!account_id || !cnpj) return;
 
-      CNPJS[id] = {
-        id,
-        account_id,
-        cnpj: cnpj.replace(/\\D/g, ''),
-        razao,
-        dominio,
-      };
-      saveToLocal();
+      try {
+        await fetchJSON('/api/cnpjs', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            id,
+            account_id,
+            cnpj: cnpj.replace(/\\D/g, ''),
+            razao,
+            dominio,
+          }),
+        });
 
-      document.getElementById('cnpj-id').value = '';
-      document.getElementById('inp-cnpj').value = '';
-      document.getElementById('inp-razao').value = '';
-      document.getElementById('inp-dominio').value = '';
-      const modalEl = document.getElementById('modalCNPJ');
-      const modal = bootstrap.Modal.getInstance(modalEl) || new bootstrap.Modal(modalEl);
-      modal.hide();
-      renderCnpjs();
-      renderCnpjsLancar();
-      loadStatus();
+        document.getElementById('cnpj-id').value = '';
+        document.getElementById('inp-cnpj').value = '';
+        document.getElementById('inp-razao').value = '';
+        document.getElementById('inp-dominio').value = '';
+        const modalEl = document.getElementById('modalCNPJ');
+        const modal = bootstrap.Modal.getInstance(modalEl) || new bootstrap.Modal(modalEl);
+        modal.hide();
+        await loadConfigFromBackend();
+        await loadStatus();
+      } catch (err) {
+        alert('Erro ao salvar CNPJ: ' + err.message);
+      }
     });
 
-    tbodyCnpjs.addEventListener('click', (e) => {
+    tbodyCnpjs.addEventListener('click', async (e) => {
       const btn = e.target.closest('button');
       if (!btn) return;
       const editId = btn.getAttribute('data-edit');
@@ -1928,15 +1851,17 @@ PAGE_CLIENT = """<!doctype html>
         modal.show();
       } else if (delId) {
         if (!confirm('Remover este CNPJ?')) return;
-        delete CNPJS[delId];
-        saveToLocal();
-        renderCnpjs();
-        renderCnpjsLancar();
-        loadStatus();
+        try {
+          await fetchJSON('/api/cnpjs/' + delId, { method: 'DELETE' });
+          await loadConfigFromBackend();
+          await loadStatus();
+        } catch (err) {
+          alert('Erro ao remover CNPJ: ' + err.message);
+        }
       }
     });
 
-    // === Import XLSX (servidor só parseia, front grava em localStorage) ===
+    // === Import XLSX: backend já grava no pCloud, front só mostra resultado ===
     document.getElementById('form-import').addEventListener('submit', async (e) => {
       e.preventDefault();
       const accId = importAccountSelect.value;
@@ -1949,24 +1874,9 @@ PAGE_CLIENT = """<!doctype html>
       statusEl.textContent = 'Importando...';
       try {
         const resp = await fetchJSON('/api/import_cnpjs', { method: 'POST', body: fd });
-        const list = resp.cnpjs || {};
-        let imported = 0;
-        (list || []).forEach(row => {
-          const id = genId();
-          CNPJS[id] = {
-            id,
-            account_id: accId,
-            cnpj: (row.cnpj || '').replace(/\\D/g, ''),
-            razao: row.razao || '',
-            dominio: row.dominio || '',
-          };
-          imported++;
-        });
-        saveToLocal();
-        statusEl.textContent = 'Importados: ' + imported;
-        renderCnpjs();
-        renderCnpjsLancar();
-        loadStatus();
+        statusEl.textContent = 'Importados: ' + (resp.imported || 0) + ', atualizados: ' + (resp.updated || 0);
+        await loadConfigFromBackend();
+        await loadStatus();
       } catch (err) {
         statusEl.textContent = 'Erro ao importar: ' + err.message;
       }
@@ -1988,7 +1898,7 @@ PAGE_CLIENT = """<!doctype html>
     filterAccLancar.addEventListener('change', renderCnpjsLancar);
     filterDomLancar.addEventListener('change', renderCnpjsLancar);
 
-    // === Enfileirar execução (COM confirmação) ===
+    // === Enfileirar execução (usa cnpjs/contas do backend, não mais localStorage) ===
     btnEnfileirar.addEventListener('click', async () => {
       const provider = document.getElementById('provider').value || '1';
       const mes = document.getElementById('mes').value;
@@ -2011,13 +1921,9 @@ PAGE_CLIENT = """<!doctype html>
         return;
       }
 
-      // Confirmação clara para o usuário
       const confirmMsg = `Tem certeza que deseja iniciar a execução para ${cnpj_ids.length} CNPJ(s)?\\nMês/Ano: ${mes}/${ano}`;
-      if (!confirm(confirmMsg)) {
-        return;
-      }
+      if (!confirm(confirmMsg)) return;
 
-      // feedback visual no botão
       const originalHtml = btnEnfileirar.innerHTML;
       btnEnfileirar.disabled = true;
       btnEnfileirar.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Enfileirando...';
@@ -2033,8 +1939,6 @@ PAGE_CLIENT = """<!doctype html>
             etapas,
             formato_dominio,
             cnpj_ids,
-            accounts: Object.values(ACCS),
-            cnpjs: Object.values(CNPJS),
           }),
         });
         enfileirarResult.className = 'mt-3 small text-center text-success';
@@ -2062,12 +1966,10 @@ PAGE_CLIENT = """<!doctype html>
       }
     });
 
-    // === Download ZIP real ===
     document.getElementById('btn-download').addEventListener('click', () => {
       window.location.href = '/api/download_zip';
     });
 
-    // === Logs modal (por EXECUÇÃO / JOB / CNPJ) ===
     const logFilterSelect = document.getElementById('log-filter-etapa');
     const logContentElement = document.getElementById('full-log-content');
     const logsStatusSummary = document.getElementById('logs-status-summary');
@@ -2221,23 +2123,20 @@ PAGE_CLIENT = """<!doctype html>
       window.location.href = '/logout';
     });
 
-    // Carrega usuário logado, inicializa storage por colaborador e começa loop + WS
-    fetchJSON('/api/me').then(data => {
+    // bootstrap inicial: pega /api/me, depois carrega config (pCloud) e status, e conecta WS
+    fetchJSON('/api/me').then(async (data) => {
       if (data && data.colaborador && navUsernameEl) {
         navUsernameEl.textContent = data.colaborador;
       }
-      initStorageKeys((data && data.colaborador_norm) || 'default');
-      loadAll();     // snapshot inicial via REST
-      connectWS();   // tempo real via WS
-      // fallback: se WS morrer, ainda fazemos um refresh leve
+      await loadAll();
+      connectWS();
       setInterval(() => {
         if (!STATUS_WS || STATUS_WS.readyState !== WebSocket.OPEN) {
           loadStatus();
         }
       }, 30000);
-    }).catch(() => {
-      initStorageKeys('default');
-      loadAll();
+    }).catch(async () => {
+      await loadAll();
       connectWS();
       setInterval(() => {
         if (!STATUS_WS || STATUS_WS.readyState !== WebSocket.OPEN) {
@@ -2251,14 +2150,11 @@ PAGE_CLIENT = """<!doctype html>
 </html>
 """
 
-
-
 # ===================== ROTAS (REST) =====================
 
 @app.get("/")
 async def root():
-    # Se quiser injetar um HTML gigante do front, substitua o placeholder
-    html = PAGE_CLIENT.replace("REPLACE_WITH_YOUR_FULL_PAGE_CLIENT_HTML", "")
+    html = PAGE_CLIENT
     return HTMLResponse(html, media_type="text/html")
 
 
@@ -2355,9 +2251,179 @@ def normalize(s: str) -> str:
     return s
 
 
+# ============= NOVAS ROTAS DE CONFIG (contas e CNPJs via pCloud) =============
+
+@app.get("/api/config")
+async def api_config(request: Request):
+    sess = getattr(request.state, "session", None) or await get_session_from_request(request)
+    if not sess:
+        raise HTTPException(401, "Não autenticado")
+    tenant = sess.get("colaborador_norm", "")
+    if not tenant:
+        raise HTTPException(401, "Sessão inválida")
+
+    db, cfg = load_tenant_cfg(tenant)
+    accounts_out = []
+    for acc in cfg.get("accounts", {}).values():
+        accounts_out.append(
+            {
+                "id": acc.get("id"),
+                "provider": acc.get("provider", "1"),
+                "user": acc.get("user", ""),
+                "alias": acc.get("alias", ""),
+            }
+        )
+    cnpjs_out = []
+    for c in cfg.get("cnpjs", {}).values():
+        cnpjs_out.append(
+            {
+                "id": c.get("id"),
+                "account_id": c.get("account_id", ""),
+                "cnpj": c.get("cnpj", ""),
+                "razao": c.get("razao", ""),
+                "dominio": c.get("dominio", ""),
+            }
+        )
+    return {"accounts": accounts_out, "cnpjs": cnpjs_out}
+
+
+@app.post("/api/accounts")
+async def api_accounts_upsert(request: Request):
+    sess = getattr(request.state, "session", None) or await get_session_from_request(request)
+    if not sess:
+        raise HTTPException(401, "Não autenticado")
+    tenant = sess.get("colaborador_norm", "")
+    if not tenant:
+        raise HTTPException(401, "Sessão inválida")
+
+    payload = await request.json()
+    acc_id = payload.get("id") or uuid.uuid4().hex
+    provider = str(payload.get("provider") or "1")
+    user = (payload.get("user") or "").strip()
+    password = payload.get("password") or ""
+    alias = (payload.get("alias") or "").strip()
+    if not user or not password:
+        raise HTTPException(400, "Usuário e senha são obrigatórios.")
+
+    db, cfg = load_tenant_cfg(tenant)
+    cfg_accounts = cfg.setdefault("accounts", {})
+    cfg_accounts[acc_id] = {
+        "id": acc_id,
+        "provider": provider,
+        "user": user,
+        "password": password,
+        "alias": alias,
+    }
+    save_tenant_cfg(db)
+
+    return {
+        "status": "ok",
+        "account": {
+            "id": acc_id,
+            "provider": provider,
+            "user": user,
+            "alias": alias,
+        },
+    }
+
+
+@app.delete("/api/accounts/{acc_id}")
+async def api_accounts_delete(request: Request, acc_id: str):
+    sess = getattr(request.state, "session", None) or await get_session_from_request(request)
+    if not sess:
+        raise HTTPException(401, "Não autenticado")
+    tenant = sess.get("colaborador_norm", "")
+    if not tenant:
+        raise HTTPException(401, "Sessão inválida")
+
+    db, cfg = load_tenant_cfg(tenant)
+    accs = cfg.setdefault("accounts", {})
+    cnpjs = cfg.setdefault("cnpjs", {})
+    if acc_id in accs:
+        del accs[acc_id]
+        for c in cnpjs.values():
+            if c.get("account_id") == acc_id:
+                c["account_id"] = ""
+        save_tenant_cfg(db)
+    return {"status": "ok"}
+
+
+@app.post("/api/cnpjs")
+async def api_cnpjs_upsert(request: Request):
+    sess = getattr(request.state, "session", None) or await get_session_from_request(request)
+    if not sess:
+        raise HTTPException(401, "Não autenticado")
+    tenant = sess.get("colaborador_norm", "")
+    if not tenant:
+        raise HTTPException(401, "Sessão inválida")
+
+    payload = await request.json()
+    cid = payload.get("id") or uuid.uuid4().hex
+    account_id = str(payload.get("account_id") or "").strip()
+    cnpj_raw = str(payload.get("cnpj") or "")
+    cnpj = cnpj_digits(cnpj_raw)
+    razao = (payload.get("razao") or "").strip()
+    dominio = (payload.get("dominio") or "").strip()
+
+    if not account_id or not cnpj:
+        raise HTTPException(400, "Conta e CNPJ são obrigatórios.")
+
+    db, cfg = load_tenant_cfg(tenant)
+    accs = cfg.setdefault("accounts", {})
+    if account_id not in accs:
+        raise HTTPException(400, "Conta informada não existe para este usuário.")
+
+    cnpjs = cfg.setdefault("cnpjs", {})
+    cnpjs[cid] = {
+        "id": cid,
+        "account_id": account_id,
+        "cnpj": cnpj,
+        "razao": razao,
+        "dominio": dominio,
+    }
+    save_tenant_cfg(db)
+
+    return {
+        "status": "ok",
+        "cnpj": {
+            "id": cid,
+            "account_id": account_id,
+            "cnpj": cnpj,
+            "razao": razao,
+            "dominio": dominio,
+        },
+    }
+
+
+@app.delete("/api/cnpjs/{cnpj_id}")
+async def api_cnpjs_delete(request: Request, cnpj_id: str):
+    sess = getattr(request.state, "session", None) or await get_session_from_request(request)
+    if not sess:
+        raise HTTPException(401, "Não autenticado")
+    tenant = sess.get("colaborador_norm", "")
+    if not tenant:
+        raise HTTPException(401, "Sessão inválida")
+
+    db, cfg = load_tenant_cfg(tenant)
+    cnpjs = cfg.setdefault("cnpjs", {})
+    if cnpj_id in cnpjs:
+        del cnpjs[cnpj_id]
+        save_tenant_cfg(db)
+    return {"status": "ok"}
+
+
+# ===================== IMPORT CNPJS XLSX (agora grava no pCloud) =====================
+
 @app.post("/api/import_cnpjs")
-async def api_import_cnpjs(account_id: str = Form(...), file: UploadFile = File(...)):
+async def api_import_cnpjs(request: Request, account_id: str = Form(...), file: UploadFile = File(...)):
     dbg("[import] recebendo arquivo:", file.filename, "para account:", account_id)
+
+    sess = getattr(request.state, "session", None) or await get_session_from_request(request)
+    if not sess:
+        raise HTTPException(401, "Não autenticado")
+    tenant = sess.get("colaborador_norm", "")
+    if not tenant:
+        raise HTTPException(401, "Sessão inválida")
 
     from openpyxl import load_workbook
     from io import BytesIO
@@ -2392,8 +2458,6 @@ async def api_import_cnpjs(account_id: str = Form(...), file: UploadFile = File(
             key = headers_norm[col_i] if col_i < len(headers_norm) else f"col{col_i}"
             record[key] = cell
 
-        dbg(f"[import] Linha {row_i} record=", record)
-
         cnpj = str(record.get("cnpj") or "").strip()
 
         razao = str(
@@ -2412,16 +2476,55 @@ async def api_import_cnpjs(account_id: str = Form(...), file: UploadFile = File(
             or ""
         ).strip()
 
-        dbg(f"[import] Linha {row_i}: cnpj='{cnpj}' razao='{razao}' dominio='{dominio}'")
-
         if not cnpj:
             continue
 
         rows_out.append({"cnpj": cnpj, "razao": razao, "dominio": dominio})
 
     dbg(f"[import] TOTAL extraídos: {len(rows_out)} registros")
-    return {"cnpjs": rows_out}
 
+    # grava no pCloud para este tenant
+    db, cfg = load_tenant_cfg(tenant)
+    accs = cfg.setdefault("accounts", {})
+    if account_id not in accs:
+        raise HTTPException(400, "Conta de acesso inválida para este usuário.")
+    cnpjs = cfg.setdefault("cnpjs", {})
+
+    created = 0
+    updated = 0
+
+    for row in rows_out:
+        cnpj_dig = cnpj_digits(row["cnpj"])
+        razao = row["razao"]
+        dominio = row["dominio"]
+
+        existing_id = None
+        for cid, c in cnpjs.items():
+            if c.get("cnpj") == cnpj_dig and c.get("account_id") == account_id:
+                existing_id = cid
+                break
+
+        if existing_id:
+            cnpjs[existing_id]["razao"] = razao
+            cnpjs[existing_id]["dominio"] = dominio
+            updated += 1
+        else:
+            cid = uuid.uuid4().hex
+            cnpjs[cid] = {
+                "id": cid,
+                "account_id": account_id,
+                "cnpj": cnpj_dig,
+                "razao": razao,
+                "dominio": dominio,
+            }
+            created += 1
+
+    save_tenant_cfg(db)
+
+    return {"cnpjs": rows_out, "imported": created, "updated": updated}
+
+
+# ===================== ENQUEUE (agora usando contas/CNPJs do pCloud) =====================
 
 @app.post("/api/enqueue")
 async def api_enqueue(request: Request, payload: Dict[str, Any]):
@@ -2442,13 +2545,13 @@ async def api_enqueue(request: Request, payload: Dict[str, Any]):
     formato_dominio = bool(payload.get("formato_dominio"))
     cnpj_ids = payload.get("cnpj_ids") or []
 
-    accounts_list = payload.get("accounts") or []
-    cnpjs_list = payload.get("cnpjs") or []
-    accs = {str(a.get("id")): a for a in accounts_list if a.get("id")}
-    cnps = {str(c.get("id")): c for c in cnpjs_list if c.get("id")}
-
     if not cnpj_ids:
         raise HTTPException(400, "Nenhum CNPJ selecionado.")
+
+    # carrega config do pCloud
+    db, cfg = load_tenant_cfg(tenant)
+    accs: Dict[str, Any] = cfg.get("accounts", {})
+    cnps: Dict[str, Any] = cfg.get("cnpjs", {})
 
     mes_str = f"{mes}/{ano}"
     tipo_estrutura = "dominio" if formato_dominio else "convencional"
@@ -2548,7 +2651,7 @@ async def api_enqueue(request: Request, payload: Dict[str, Any]):
             }
 
     if total_jobs == 0:
-        raise HTTPException(400, "Nenhum job foi enfileirado (verifique senhas e contas).")
+        raise HTTPException(400, "Nenhum job foi enfileirado (verifique senhas, contas e CNPJs).")
 
     await save_runs(rd, tenant, runs)
     await rd.publish(f"{REDIS_LOG_NS}:front:{tenant}:runs:updated", json.dumps(runs))
@@ -2599,6 +2702,7 @@ async def api_kpis(request: Request):
     kpis["last_run_str"] = last_str
     kpis["arq_enabled"] = ARQ_ENABLED
     return {"kpis": kpis}
+
 
 
 # ===================== STATUS INDEX =====================
