@@ -3498,17 +3498,28 @@ async def ws_bridge(websocket: WebSocket):
 
 # ===================== SCHEDULER INTERNO — Y ➜ ARQ =====================
 
+MAX_QUEUE = 10  # limite da fila
+
 async def scheduler_y_to_arq():
     print("[scheduler] iniciado!")
-    rd: AsyncRedisWS = app.state.redis_scheduler
+    rd = app.state.redis_scheduler
 
     while True:
         try:
-            colabs = await rd.smembers(PREQUEUE_COLABS_SET)
-            if not colabs:
+            # 1) se existe job rodando → não manda nada
+            running = await rd.scan("arq:in-progress:*")
+            if running[1]:
                 await asyncio.sleep(1)
                 continue
 
+            # 2) se fila cheia → não manda nada
+            queue_len = await rd.zcard("arq:queue")
+            if queue_len >= MAX_QUEUE:
+                await asyncio.sleep(1)
+                continue
+
+            # 3) pega 1 job da pré-fila
+            colabs = await rd.smembers(PREQUEUE_COLABS_SET)
             for colab in colabs:
                 y_key = f"{PREQUEUE_NS}:colab:{colab}"
 
@@ -3517,24 +3528,24 @@ async def scheduler_y_to_arq():
                     continue
 
                 env = json.loads(raw)
-                func = env.get("func")
-                args_list = env.get("args") or []
-                job_id = env.get("enqueue_kwargs", {}).get("_job_id")
-                if not job_id:
-                    continue
+                func = env["func"]
+                args_list = env["args"]
+                job_id = env["enqueue_kwargs"]["_job_id"]
 
                 now_ms = int(time.time() * 1000)
-
                 jobdef = {"t": 1, "f": func, "a": tuple(args_list), "k": {}, "et": now_ms}
 
                 await rd.set(f"arq:job:{job_id}", pickle.dumps(jobdef))
                 await rd.zadd("arq:queue", now_ms, job_id)
 
-                print(f"[scheduler] job {job_id} → ARQ OK")
+                print("[scheduler] liberei 1 job da pré-fila:", job_id)
+                break
+
         except Exception as e:
             print("[scheduler] erro:", repr(e))
 
         await asyncio.sleep(0.25)
+
 
 
 # ===================== MAIN =====================
