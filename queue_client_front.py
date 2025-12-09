@@ -390,7 +390,7 @@ PREQUEUE_NS = os.getenv("PREQUEUE_NS", f"{REDIS_LOG_NS}:y")
 PREQUEUE_COLABS_SET = f"{PREQUEUE_NS}:colabs"
 
 FRONT_LAST_RUN_KEY = f"{REDIS_LOG_NS}:front:last_run_ts"
-ARQ_ENABLED = False
+ARQ_ENABLED = True  # agora estamos enfileirando direto na fila ARQ
 
 SESSION_COOKIE_NAME = os.getenv("FRONT_SESSION_COOKIE", "iss_front_session")
 SESSION_TTL = int(os.getenv("FRONT_SESSION_TTL", "86400"))
@@ -629,22 +629,13 @@ async def auth_middleware(request: Request, call_next):
 async def startup():
     app.state.redis_cmd = AsyncRedisWS(REDIS_WS_URL, token=REDIS_TOKEN, name="cmd")
     await app.state.redis_cmd.connect()
-
-    app.state.redis_scheduler = AsyncRedisWS(REDIS_WS_URL, token=REDIS_TOKEN, name="sched")
-    await app.state.redis_scheduler.connect()
-
-    dbg("[startup] Redis WS OK (cmd/sched)")
-    asyncio.create_task(scheduler_y_to_arq())
+    dbg("[startup] Redis WS OK (cmd)")
 
 
 @app.on_event("shutdown")
 async def shutdown():
     try:
         await app.state.redis_cmd.aclose()
-    except Exception:
-        pass
-    try:
-        await app.state.redis_scheduler.aclose()
     except Exception:
         pass
     print("Shutdown concluído (WS fechados).")
@@ -667,6 +658,8 @@ async def save_runs(rd: AsyncRedisWS, tenant: str, data: Dict[str, Dict[str, Any
         return
     await rd.set(runs_key_for(tenant), json.dumps(data))
 
+
+# ===================== PÁGINAS HTML (login + client) =====================
 
 # ===================== PÁGINAS HTML (login + client) =====================
 
@@ -2524,7 +2517,7 @@ async def api_import_cnpjs(request: Request, account_id: str = Form(...), file: 
     return {"cnpjs": rows_out, "imported": created, "updated": updated}
 
 
-# ===================== ENQUEUE (agora usando contas/CNPJs do pCloud) =====================
+# ===================== ENQUEUE (agora direto na fila ARQ, sem pré-fila) =====================
 
 @app.post("/api/enqueue")
 async def api_enqueue(request: Request, payload: Dict[str, Any]):
@@ -2619,17 +2612,21 @@ async def api_enqueue(request: Request, payload: Dict[str, Any]):
             else:
                 args = [colaborador_norm, cd, mes_str, usuario, senha, tipo_estrutura]
 
+            # === NOVO: cria job direto na fila ARQ, sem passar pela pré-fila ===
             job_id = uuid.uuid4().hex
-            env = {
-                "func": func,
-                "args": args,
-                "enqueue_kwargs": {"_job_id": job_id},
-                "colaborador_norm": colaborador_norm,
+            now_ms = int(time.time() * 1000)
+
+            jobdef = {
+                "t": 1,
+                "f": func,
+                "a": tuple(args),
+                "k": {},
+                "et": now_ms,
             }
 
-            y_key = f"{PREQUEUE_NS}:colab:{colaborador_norm}"
-            await rd.sadd(PREQUEUE_COLABS_SET, colaborador_norm)
-            await rd.rpush(y_key, json.dumps(env))
+            await rd.set(f"arq:job:{job_id}", pickle.dumps(jobdef))
+            await rd.zadd("arq:queue", now_ms, job_id)
+
             total_jobs += 1
             run_job_ids.append(job_id)
             run_etapas_flags[etapa_key] = True
@@ -2719,6 +2716,7 @@ async def build_status_index(
     keys = list(relevant_cnpjs.keys())  # existing keys coming from runs
 
     # ---- varredura da pré-fila para acrescentar CNPJs que só estão em waiting ----
+    # (continua existindo, mas como não enfileiramos mais na pré-fila, deve ficar vazio)
     try:
         colabs = await rd.smembers(PREQUEUE_COLABS_SET)
     except Exception:
@@ -2790,7 +2788,7 @@ async def build_status_index(
         if key1 in events:
             events[key1].setdefault(etapa, []).append({"status": st_str, "job_id": job_id})
 
-    # 1) Pré-fila (waiting)
+    # 1) Pré-fila (waiting) — na prática, vai ficar vazio agora
     for colab in colabs:
         y_key = f"{PREQUEUE_NS}:colab:{colab}"
         try:
@@ -3494,88 +3492,6 @@ async def ws_bridge(websocket: WebSocket):
         pass
     finally:
         await livehub.detach(tenant, websocket)
-
-
-# ===================== SCHEDULER INTERNO — Y ➜ ARQ =====================
-
-MAX_QUEUE = 10  # limite máximo de jobs na arq:queue
-
-async def scheduler_y_to_arq():
-    print("[scheduler] iniciado!")
-    rd = app.state.redis_scheduler
-
-    # armazenar ordem dos colaboradores
-    rr_index = 0
-
-    while True:
-        try:
-            # 1) Se existe job em execução → não enviar nada
-            running_keys = await rd.scan("arq:in-progress:*")
-            if running_keys[1]:
-                await asyncio.sleep(0.5)
-                continue
-
-            # 2) Se a fila estiver cheia → esperar
-            queue_len = await rd.zcard("arq:queue")
-            if queue_len >= MAX_QUEUE:
-                await asyncio.sleep(0.5)
-                continue
-
-            # 3) Listar colaboradores que têm pré-fila
-            colabs = list(await rd.smembers(PREQUEUE_COLABS_SET))
-
-            if not colabs:
-                await asyncio.sleep(0.5)
-                continue
-
-            # ---- ROUND ROBIN DE COLABORADORES ----
-            colabs.sort()  # ordem estável
-            colab = colabs[rr_index % len(colabs)]
-            rr_index += 1
-
-            y_key = f"{PREQUEUE_NS}:colab:{colab}"
-
-            # 4) Pega **UM** job da pré-fila desse colaborador
-            raw = await rd.lpop(y_key)
-            if not raw:
-                # se estava vazio → remover do set
-                await rd.srem(PREQUEUE_COLABS_SET, colab)
-                continue
-
-            env = json.loads(raw)
-            func = env.get("func")
-            args_list = env.get("args") or []
-            job_id = env.get("enqueue_kwargs", {}).get("_job_id")
-
-            if not func or not job_id:
-                continue
-
-            # 5) Criar estrutura do job ARQ
-            now_ms = int(time.time() * 1000)
-            jobdef = {
-                "t": 1,
-                "f": func,
-                "a": tuple(args_list),
-                "k": {},
-                "et": now_ms
-            }
-
-            await rd.set(f"arq:job:{job_id}", pickle.dumps(jobdef))
-            await rd.zadd("arq:queue", now_ms, job_id)
-
-            print(f"[scheduler][RR] Liberado job {job_id} do colaborador {colab}")
-
-            # Se a lista ficou vazia → remover do set
-            list_len = await rd.llen(y_key)
-            if list_len == 0:
-                await rd.srem(PREQUEUE_COLABS_SET, colab)
-
-        except Exception as e:
-            print("[scheduler] erro:", repr(e))
-
-        await asyncio.sleep(0.20)
-
-
 
 
 # ===================== MAIN =====================
